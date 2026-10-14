@@ -1834,7 +1834,7 @@ MODE_SETTINGS: dict = {
     "neutral": {
         "external": "warn",
         "document_block": "warn",
-        "model": "audit",
+        "model": "on",
         "places": False,
         # Too weak by default: ordinary company names and cities.
         "weak_kinds": ("ORGANIZATION", "ADDRESS", "ALAMAT", "KODEPOS", "POSTAL", "LOCATION", "GPE"),

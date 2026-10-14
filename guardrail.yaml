@@ -93,7 +93,7 @@ modes:
   neutral:
     external: warn          # external rules advise, never block
     document_block: warn    # a block hit inside tool output warns instead
-    model: audit            # model layer records, does not mask
+    model: on               # model layer masks names
     places: false           # city and address names are not masked
     weak_kinds: [ORGANIZATION, ADDRESS, ALAMAT, KODEPOS, POSTAL, LOCATION, GPE]
   persistent:

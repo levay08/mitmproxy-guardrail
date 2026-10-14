@@ -1441,6 +1441,16 @@ proxy_start() {
   say "proxy started as $PUSER, pid $(tr '\n' ' ' <"$PIDFILE")$([ "$DEV" = 1 ] && echo ' [dev]')"
 }
 
+# one plain line: which strictness the proxy reads now
+mode_line() {
+  local m="neutral"
+  [ -f "$STATE/mode" ] && [ ! -L "$STATE/mode" ] && m="$(tr -d '[:space:]' <"$STATE/mode")"
+  case "$m" in
+    persistent) echo "persistent: names masked, places masked, stable external rules block" ;;
+    *) echo "neutral: emails, ids and names are masked; places stay; external rules only warn" ;;
+  esac
+}
+
 set_mode() {
   local want="${1:-}"
   case "$want" in
@@ -2876,6 +2886,8 @@ install_all() {
   if [ "$do_arm" = 1 ]; then
     arm "$dur"
   else
+    say "mode       : $(mode_line)"
+    say "  stricter: sudo $SELF mode persistent"
     say "rule NOT armed: nothing of yours is diverted yet"
     say "  arm it when you are ready: sudo $SELF arm $dur"
     say "  note: clients that were already running may not trust the CA until you log out and back in"
@@ -2934,6 +2946,7 @@ verify() {
   bad() { printf '  FAIL  %s\n' "$*"; fail=1; }
   note() { printf '  NOTE  %s\n' "$*"; }
   echo "== verify"
+  ok "mode in force: $(mode_line)"
   if puser_exists; then ok "user: $(id "$PUSER"), shell $(getent passwd "$PUSER" | cut -d: -f7)"
   else bad "user $PUSER missing"; fi
   # venv python runs as root only after tree_ok passed
@@ -3058,11 +3071,8 @@ uninstall() {
   while IFS= read -r l; do
     case "$l" in /etc/environment.d/*guardrail*|/etc/profile.d/*guardrail*) rm -f "$l" && say "removed $l" ;; esac
   done < <(rec_get ENVFILE)
-  if [ "${KEEP_AUDIT:-0}" = 1 ]; then
-    rm -rf "$LIBDIR" "$VARDIR" && say "removed $LIBDIR $VARDIR; $LOGDIR kept"
-  else
-    rm -rf "$LIBDIR" "$VARDIR" "$LOGDIR" && say "removed $LIBDIR $VARDIR $LOGDIR"
-  fi
+  # the audit log is evidence; only purge-logs deletes it
+  rm -rf "$LIBDIR" "$VARDIR" && say "removed $LIBDIR $VARDIR; $LOGDIR kept (delete by hand: sudo rm -r $LOGDIR)"
   if puser_exists; then
     pkill -u "$PUSER" 2>/dev/null; sleep 0.5; pkill -9 -u "$PUSER" 2>/dev/null
     { userdel "$PUSER" 2>/dev/null || deluser "$PUSER" 2>/dev/null; } && say "$PUSER removed"
@@ -3096,7 +3106,7 @@ rollback() {
   fi
   if [ -d "$LIBDIR" ] || [ -d "$VARDIR" ] || [ -f "$RECORD" ]; then
     say "rollback: no previous app copy, so this removes the install; the audit log is kept"
-    KEEP_AUDIT=1 uninstall
+    uninstall
   else
     disarm
     proxy_stop
