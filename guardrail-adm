@@ -722,8 +722,7 @@ sync_collect() {
 
 # build $LIST, $LIST6 and $LISTNAT from kind:path specs in $@
 build_lists() {
-  # typed sets: v4 and v6 split; -I isolates the interpreter
-  # NAT64_SITE: venv libs, so PyYAML is found without the venv python
+  # v4/v6 sets; -I python finds PyYAML via NAT64_SITE
   rm -f "$LIST6.skipped"  # a dead build must not leave a stale count
   NAT64_CFG="${RUN_APP:+$RUN_APP/guardrail.yaml}" NAT64_OUT="${LISTNAT:-}" \
     NAT64_SITE="${VENV:+$VENV/lib}" python3 -I - "$LIST" "$LIST6" "$@" <<'PY'
@@ -797,7 +796,7 @@ def nat64_prefixes():
             doc = yaml.safe_load(open(cfg, encoding="utf-8")) or {}
             raw = doc.get("nat64_prefixes") if isinstance(doc, dict) else None
         except Exception as exc:
-            # the type only: a parse error text can quote the file
+            # type only: parse error text can quote the file
             notes.append(f"nat64_prefixes: {cfg} not read ({type(exc).__name__}); default {WKP} used")
     if raw is None:
         return [ipaddress.ip_network(WKP)], notes
@@ -904,7 +903,7 @@ apply_sets() {
   fi
 }
 
-# resolve the watched hosts once when no endpoint list exists yet
+# resolve watched hosts once if no endpoint list
 seed_endpoints() {
   local who="$PUSER" home="$STATE" py
   py="$(dirname "$MITMDUMP")/python"
@@ -1200,7 +1199,7 @@ add_rule() {
   # empty nat64 set: keep the well-known prefix exempt, as before
   $NFT list set inet guardrail nat64 | grep -q 'elements = ' \
     || $NFT add element inet guardrail nat64 '{ 64:ff9b::/96 }'
-  # QUIC like TCP: v6 outside ai6 must not depend on set contents
+  # QUIC like TCP: v6 outside ai6 ignores set contents
   $NFT add rule inet guardrail quic meta skuid "$UID_TARGET" udp dport 443 \
     ip6 daddr != @ai6 ip6 daddr != @nat64 counter reject
   # reset real AAAA outside ai6; NAT64 prefixes outside ai6 pass
@@ -1905,7 +1904,7 @@ arm_window_ok() {
   fi
 }
 
-# Refuse before any rule when the redirect target is not served.
+# Refuse before any rule if redirect target is unserved.
 redirect_target_ok() {
   local l v4 v6
   l="$(proxy_listeners)"; v4="${l%%:*}"; v6="${l##*:}"
@@ -1925,7 +1924,7 @@ redirect_target_ok() {
 arm() {
   local users rp
   arm_window_ok "${1:-15m}"
-  # arm never starts the proxy: no listener means refuse, nothing changed
+  # arm never starts the proxy; no listener means refuse
   proxy_up || die "REFUSED: nothing listens on port $PORT; start the proxy first: sudo $SELF proxy-start"
   users="$(listener_users)"
   case " $users " in
@@ -2054,7 +2053,7 @@ EOF
   say "units written in $UNITDIR, nothing enabled yet"
 }
 
-# the block banner runs in the user session; the proxy has no bus
+# banner runs in the user session; proxy has no bus
 user_notifier_install() {
   [ -f "$IAPP/notify_user.py" ] || { say "no notify_user.py in $IAPP; no user notifier unit"; return 0; }
   install -d -o root -g root -m 0755 "$USERUNITDIR"
@@ -2354,7 +2353,7 @@ build_venv() {
   while IFS= read -r line; do
     [[ "$line" =~ ^[A-Za-z0-9._-]+==[A-Za-z0-9.+!_-]+$ ]] && printf '%s\n' "$line" >>"$cons"
   done < <(as_owner cat "$APP/constraints.txt" 2>/dev/null)
-  # CPU-only torch wheel: the default one drags in ~3 GB of CUDA
+  # CPU-only torch wheel; default pulls ~3 GB CUDA
   printf '%s\n' "${pins[@]}" | grep -q '^gliner\(==\|$\)' && extra=(--extra-index-url https://download.pytorch.org/whl/cpu)
   say "pip: $(wc -l <"$cons") constrained versions; staging in $pipdir (disk, not tmpfs)"
   # no config, no cache, no sdist: nothing untrusted as root
@@ -2931,7 +2930,7 @@ yaml_loader_line() {
   esac
 }
 
-# load the model once, as the proxy user; a failed load is a FAIL
+# load the model once as proxy user; failure is FAIL
 model_load_check() {
   local out
   if out="$(as_puser env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$STATE" HF_HOME="$HFDIR" HF_HUB_OFFLINE=1 \

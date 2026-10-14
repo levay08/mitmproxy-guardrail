@@ -9,3 +9,14 @@ logs/
 proxy.pac
 .tmp/
 ca-bundle.pem
+# Local scratch, session copies and editor leftovers.
+detected-apps.json
+wiki/
+state/
+session/
+venv/
+audit.jsonl
+proxy.log
+*.pid
+*.bak-*
+.pytest_cache/
