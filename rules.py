@@ -1673,7 +1673,7 @@ def _obey_quoted(text: str, m: re.Match) -> bool:
 
 
 DISCUSSION_NOUN = re.compile(
-    r"(?i)\b(?:phrase|sentence|words?|wording|string|text|expression|frasa|kalimat|kata|ungkapan|teks)\b"
+    r"(?i)\b(?:phrase|sentence|words?|wording|string|text|expression|frasa|kalimat|kata|ungkapan|teks|pesan|message)\b"
     r"[^\n\"'`“‘]{0,25}$")
 
 
@@ -3155,6 +3155,8 @@ def mask_text(text: str, counters: dict, mapping: dict,
                 return m.group(0)
             if kind.startswith("EMAIL") and ROLE_MAILBOX.fullmatch(m.group(0)):
                 return m.group(0)
+            if kind.startswith("AI_PROMPT_INJECTION") and quoted_discussion(s, m.group(0)):
+                return m.group(0)
             kinds.append(kind)
             return _token(kind, counters, mapping, m.group(0))
         return pattern.sub(repl, s)
@@ -3469,6 +3471,8 @@ def _apply_corpus_rule(rule: dict, out: str, counters: dict, mapping: dict,
             continue
         if DATE_FRAGMENT.fullmatch(raw.strip()):
             continue                   # a date is a date, not a data leak
+        if kind.startswith("AI_PROMPT_INJECTION") and quoted_discussion(out, raw):
+            continue
         stripped = raw.strip()
         if rule["shape_only"] and not any(c.isdigit() for c in stripped):
             continue                   # an ID shape with no digit is a word
@@ -4062,6 +4066,8 @@ USERNAME_NOUNS = COMMON_NOUNS | {
     "chatbot", "chatbots", "bot", "bots", "assistant", "asisten", "agent", "agen", "model", "llm",
     "users", "pengguna", "system", "sistem", "server", "ai", "username", "usernames",
 }
+# Role names, not people.
+ROLE_ACCOUNTS = frozenset({"admin", "administrator", "root", "guest", "anonymous", "user", "default"})
 # Words that may surround those nouns in a phrase.
 USERNAME_MODIFIERS = frozenset({
     "the", "a", "an", "our", "your", "my", "its", "this", "that", "end", "root", "guest",
@@ -4124,6 +4130,8 @@ def _maskable(ent: dict, text: str) -> bool:
         if tail and ROLE_MAILBOX.fullmatch(tail.group(1)):
             return False
     if ROLE_MAILBOX.fullmatch(text[ent.get("start", 0):ent.get("end", 0)].strip("<>()[]\"',;: ")):
+        return False
+    if label == "username" and span.strip().lower().strip("`'\".,;:") in ROLE_ACCOUNTS:
         return False
     if label == "username":
         value = text[ent.get("start", 0):ent.get("end", 0)].strip().lower().strip(".,;:!?\"'()")
