@@ -893,13 +893,16 @@ ENDPOINT_MAX_AGE=86400
 
 # resolve again when the list is old; a failed refresh keeps the old list
 refresh_stale_endpoints() {
-  local f="$STATE/data/endpoint-ips.json" age
+  local f="$STATE/data/endpoint-ips.json" age was
   [ "$DEV" = 1 ] && f="$APP/data/endpoint-ips.json"
   [ -f "$f" ] && [ ! -L "$f" ] || return 0
   age=$(( $(date +%s) - $(stat -c %Y -- "$f") ))
   [ "$age" -gt "$ENDPOINT_MAX_AGE" ] || return 0
+  was="$(stat -c %Y -- "$f")"
   say "endpoint list is $((age / 3600)) h old: resolving the watched hosts again"
-  seed_endpoints || say "refresh failed (no DNS?): keeping the list from $(date -d "@$(stat -c %Y -- "$f")" '+%F %T')"
+  # the resolver returns the old cache when DNS is down, so success is a new file time
+  seed_endpoints && [ "$(stat -c %Y -- "$f" 2>/dev/null)" != "$was" ] \
+    || say "refresh failed (no DNS?): keeping the list from $(date -d "@$was" '+%F %T')"
 }
 
 set_sync() {
@@ -2398,6 +2401,10 @@ fetch_model() {
 # owner cache first; with no --model-src, download the pinned files
 install_model_cold() {
   local src="$1" dl
+  # pins are fixed, so weights already in place need no second copy or download
+  if [ -z "$MODEL_SRC" ] && [ -d "$HFDIR" ] && tree_ok "$HFDIR" && model_check "$HFDIR"; then
+    say "model layer already in $HFDIR, every file matches its pin"; return 0
+  fi
   install_model "$src" && return 0
   [ -z "$MODEL_SRC" ] || return 1
   dl="$(as_owner mktemp -d </dev/null)" || return 1
