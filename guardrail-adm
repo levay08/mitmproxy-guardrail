@@ -2393,8 +2393,10 @@ fetch_model() {
     as_owner mkdir -p -- "${f%/*}" </dev/null || return 1
     say "model: downloading $repo/$file at $commit"
     as_owner curl -fsSL --retry 3 --connect-timeout 20 --max-time 3600 -o "$f" \
-      "https://huggingface.co/$repo/resolve/$commit/$file" </dev/null \
-      || { say "model: download of $repo/$file failed (no network to huggingface.co?)"; return 1; }
+      "https://huggingface.co/$repo/resolve/$commit/$file" </dev/null || {
+        say "model: download of $repo/$file failed (curl exit $?; 6/7 no network, 22 HTTP error, 23 disk full)"
+        return 1
+      }
   done < <(model_manifest)
 }
 
@@ -2407,7 +2409,10 @@ install_model_cold() {
   fi
   install_model "$src" && return 0
   [ -z "$MODEL_SRC" ] || return 1
-  dl="$(as_owner mktemp -d </dev/null)" || return 1
+  # the owner's disk, not /tmp: that is often tmpfs, smaller than the 1.1 GB model
+  as_owner mkdir -p -- "$USER_HOME/.cache" </dev/null
+  as_owner find "$USER_HOME/.cache" -maxdepth 1 -name 'guardrail-model.*' -mmin +60 -exec rm -rf -- {} + </dev/null 2>/dev/null
+  dl="$(as_owner mktemp -d -p "$USER_HOME/.cache" guardrail-model.XXXXXX </dev/null)" || return 1
   say "model: owner cache has no usable copy; fetching the pinned files from huggingface.co"
   if fetch_model "$dl" && install_model "$dl"; then as_owner rm -rf -- "$dl" </dev/null; return 0; fi
   as_owner rm -rf -- "$dl" </dev/null
