@@ -300,7 +300,7 @@ usage() {
   cat <<EOF
 guardrail-adm <verb> [args] [--dev]
   install [opts]         one-command install: proxy user, root venv, app copy, CA, trust, units,
-                         rule with failsafe, then verify. opts: --with-model [--model-src=DIR] --persist --failsafe=15m
+                         rule with failsafe, then verify. opts: --with-model (off by default; ~1 GB) [--model-src=DIR] --persist --failsafe=15m
                          --arm also diverts traffic now (default: install only, arm later)
                          --dry-run prints the plan for this device and changes nothing
                          run from the project tree this also writes the helper, its sudoers entry
@@ -2645,6 +2645,7 @@ dry_run_report() {
     say "rule       : NOT installed (default); your traffic is not diverted until you run arm"
   fi
   say "CA         : $([ -f "$USER_HOME/.mitmproxy/mitmproxy-ca.pem" ] && echo "copied from $USER_HOME/.mitmproxy" || echo "created new by mitmdump in $CONFDIR")"
+  [ "$with_model" = 1 ] || say "model      : NOT installed (default); free-form names pass unmasked; add --with-model"
   [ "$with_model" = 1 ] && say "option     : the language-model layer is installed too; weights are copied from ${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub} into $HFDIR if they match their pinned sha256"
   say ""
   say "after the real install, run:"
@@ -2666,6 +2667,9 @@ install_payload() {
   if [ "$with_model" = 1 ]; then
     install_model "${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub}" \
       || say "WARNING: no model layer; free-form names that escape the regex rules pass unmasked"
+  else
+    say "WARNING: model layer NOT installed (no --with-model): free-form names pass unmasked"
+    say "  regex, checksum and ATR rules still apply; add the model: guardrail-adm install --with-model"
   fi
   install_ca
   install_trust
@@ -2705,7 +2709,7 @@ install_boot_units() {
 }
 
 install_all() {
-  local with_model=1 persist=0 enable_units=0 dry=0 do_arm=0 dur=15m a
+  local with_model=0 persist=0 enable_units=0 dry=0 do_arm=0 dur=15m a
   for a in "$@"; do
     case "$a" in
       --with-model) with_model=1 ;;
@@ -2801,7 +2805,7 @@ verify() {
       elif ! tree_ok "$HFDIR"; then bad "model layer: $BAD"
       elif model_check "$HFDIR"; then ok "model weights match their pinned checksums: $(describe "$HFDIR")"
       else bad "model layer: $BAD"; fi
-    else note "model layer not installed (install --with-model); free-form names are not masked"; fi
+    else note "model layer NOT installed: free-form names pass unmasked (regex and ATR rules still apply); install --with-model"; fi
   fi
   for p in "$LIBDIR" "$VENV" "$IAPP" "$RUNNER" "$CA_PUB"; do
     # the venv lives inside LIBDIR and always holds links
