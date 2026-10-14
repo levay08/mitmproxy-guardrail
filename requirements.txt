@@ -17,6 +17,7 @@ nft     | command:nft                | nftables  | nftables        | nftables   
 sudo    | command:sudo               | sudo      | sudo            | sudo        | sudo        | sudo
 ss      | command:ss                 | iproute2  | iproute2        | iproute     | iproute2    | iproute2
 pgrep   | command:pgrep              | procps    | procps          | procps-ng   | procps      | procps-ng
+certutil| command:certutil           | nss-tools | libnss3-tools   | nss-tools   | mozilla-nss-tools | nss
 
 # Optional, same format. A missing one never stops an install; it is reported with the command
 # that installs it. notify-send draws the desktop banners; without it the watchdog logs

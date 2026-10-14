@@ -300,7 +300,7 @@ usage() {
   cat <<EOF
 guardrail-adm <verb> [args] [--dev]
   install [opts]         one-command install: proxy user, root venv, app copy, CA, trust, units,
-                         rule with failsafe, then verify. opts: --with-model (off by default; ~1 GB) [--model-src=DIR] --persist --failsafe=15m
+                         rule with failsafe, then verify. opts: --no-model (default installs the ~1 GB model layer) [--model-src=DIR] --persist --failsafe=15m
                          --arm also diverts traffic now (default: install only, arm later)
                          --dry-run prints the plan for this device and changes nothing
                          run from the project tree this also writes the helper, its sudoers entry
@@ -349,6 +349,7 @@ nft|command:nft|nftables|nftables|nftables|nftables|nftables
 sudo|command:sudo|sudo|sudo|sudo|sudo|sudo
 ss|command:ss|iproute2|iproute2|iproute|iproute2|iproute2
 pgrep|command:pgrep|procps|procps|procps-ng|procps|procps-ng
+certutil|command:certutil|nss-tools|libnss3-tools|nss-tools|mozilla-nss-tools|nss
 REQ
 }
 
@@ -442,7 +443,7 @@ requirements_install() {
   [ -n "$pkgs" ] || { say "nothing installable in that list; check the prerequisite table"; return 1; }
   cmd="$(pkg_command "$family")"
   say "installing: $cmd $pkgs"
-  if ( cd / && $cmd $pkgs ) >/dev/null 2>&1; then
+  if pkg_try "$family" $cmd $pkgs; then
     say "prerequisites installed"
   else
     say "installing the prerequisites FAILED. Run it yourself and retry: sudo $cmd $pkgs"
@@ -451,10 +452,38 @@ requirements_install() {
   return 0
 }
 
+# index refresh, three tries, backoff
+pkg_try() {
+  local family="$1" n out; shift
+  for n in 1 2 3; do
+    case "$family" in
+      debian) apt-get -o Acquire::Retries=3 update >/dev/null 2>&1 ;;
+      suse)   zypper --non-interactive refresh >/dev/null 2>&1 ;;
+      fedora) dnf makecache >/dev/null 2>&1 ;;
+    esac
+    if out="$(cd / && "$@" 2>&1 </dev/null)"; then return 0; fi
+    say "package install, attempt $n of 3, failed: $(printf '%s' "$out" | tail -n 2 | tr '\n' ' ')"
+    [ "$n" = 3 ] || sleep $((n * 5))
+  done
+  return 1
+}
+
+# best effort, never stops an install
+optional_install() {
+  local family opt pkgs cmd
+  family="$(host_family)"; [ -n "$family" ] || return 0
+  opt="$(requirements_missing optional)"; [ -n "$opt" ] || return 0
+  pkgs="$(printf '%s' "$opt" | awk '{print $2}' | grep -xE '[A-Za-z0-9][A-Za-z0-9+_-]*' | sort -u | tr '\n' ' ')"
+  [ -n "$pkgs" ] || return 0
+  cmd="$(pkg_command "$family")"
+  if pkg_try "$family" $cmd $pkgs; then say "optional tools installed: $pkgs"
+  else say "optional tools not installed (banners may not show); to add them: sudo $cmd $pkgs"; fi
+}
+
 pkg_command() {
   case "$1" in
     alpine)  echo "apk add --no-cache" ;;
-    debian)  echo "env DEBIAN_FRONTEND=noninteractive apt-get install -y" ;;
+    debian)  echo "env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y" ;;
     fedora)  echo "dnf install -y" ;;
     suse)    echo "zypper --non-interactive install -y" ;;
     arch)    echo "pacman -Sy --noconfirm" ;;
@@ -2033,8 +2062,17 @@ RestartSec=5
 WantedBy=default.target
 UNIT
   chmod 0644 "$USERUNITDIR/guardrail-notify.service"
-  say "user unit written: $USERUNITDIR/guardrail-notify.service (not enabled)"
-  say "  the owner starts it in the desktop session with: systemctl --user enable --now guardrail-notify.service"
+  say "user unit written: $USERUNITDIR/guardrail-notify.service"
+  # global enable needs no user session
+  if systemctl --global enable guardrail-notify.service >/dev/null 2>&1; then
+    say "  enabled for every login; the banner starts at your next login"
+    if [ -S "/run/user/$UID_TARGET/bus" ] && as_owner env "XDG_RUNTIME_DIR=/run/user/$UID_TARGET" \
+         "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_TARGET/bus" systemctl --user start guardrail-notify.service >/dev/null 2>&1; then
+      say "  started now in the owner session"
+    fi
+  else
+    say "  could not enable it; as the desktop user run: systemctl --user enable --now guardrail-notify.service"
+  fi
 }
 
 units_remove() {
@@ -2043,6 +2081,7 @@ units_remove() {
   rm -f "$UNITDIR/guardrail-net.service" "$UNITDIR/guardrail-proxy.service" \
         "$UNITDIR/guardrail-sync.service" "$UNITDIR/guardrail-sync.timer" \
         /etc/guardrail/guardrail.nft
+  systemctl --global disable guardrail-notify.service >/dev/null 2>&1
   rm -f "$USERUNITDIR/guardrail-notify.service"
   systemctl daemon-reload
   say "units removed, /etc/guardrail left in place"
@@ -2179,6 +2218,7 @@ install_deps() {
     return 0
   fi
   if requirements_report; then
+    [ "$NO_DEPS" = 1 ] || optional_install
     return 0
   fi
   if [ "$NO_DEPS" = 1 ]; then
@@ -2186,6 +2226,7 @@ install_deps() {
     return 0
   fi
   requirements_install || return 1
+  optional_install
   # installed but still absent: say so, do not continue
   if ! requirements_report; then
     say "prerequisites are still missing after installing; fix them, then run install again"
@@ -2307,9 +2348,26 @@ build_venv() {
   printf '%s\n' "${pins[@]}" | grep -q '^gliner\(==\|$\)' && extra=(--extra-index-url https://download.pytorch.org/whl/cpu)
   say "pip: $(wc -l <"$cons") constrained versions; staging in $pipdir (disk, not tmpfs)"
   # no config, no cache, no sdist: nothing untrusted as root
-  if ! env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root PIP_CONFIG_FILE=/dev/null TMPDIR="$pipdir" \
+  local try pip_ok=0 core=()
+  for try in 1 2 3; do
+    if env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root PIP_CONFIG_FILE=/dev/null TMPDIR="$pipdir" \
        "$VENV/bin/python" -I -m pip install --isolated --no-cache-dir --disable-pip-version-check \
-       --no-input --only-binary=:all: -c "$cons" ${extra[@]+"${extra[@]}"} "${pins[@]}"; then
+       --no-input --only-binary=:all: --retries 5 --timeout 60 -c "$cons" ${extra[@]+"${extra[@]}"} "${pins[@]}"; then
+      pip_ok=1; break
+    fi
+    say "pip attempt $try of 3 failed"; [ "$try" = 3 ] || sleep $((try * 10))
+  done
+  # model wheels optional: fall back to core
+  if [ "$pip_ok" != 1 ] && [ "$with_model" = 1 ]; then
+    for p in "${pins[@]}"; do case "$p" in gliner*|protobuf*|sentencepiece*) ;; *) core+=("$p") ;; esac; done
+    say "model packages could not be installed; retrying with the core packages only"
+    if env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root PIP_CONFIG_FILE=/dev/null TMPDIR="$pipdir" \
+       "$VENV/bin/python" -I -m pip install --isolated --no-cache-dir --disable-pip-version-check \
+       --no-input --only-binary=:all: --retries 5 --timeout 60 -c "$cons" "${core[@]}"; then
+      pip_ok=1; MODEL_DOWNGRADED=1
+    fi
+  fi
+  if [ "$pip_ok" != 1 ]; then
     rm -rf "$pipdir" "$VENV"; [ -d "$VENV.old" ] && mv "$VENV.old" "$VENV"
     die "pip could not install ${pins[*]} (no network, or no wheel for this platform).
   Nothing was switched: $([ -d "$VENV" ] && echo "the previous $VENV is back in place" || echo "no venv is installed").
@@ -2367,8 +2425,13 @@ install_model() {
     printf '%s' "$commit" >"$stage/hub/$d/refs/main"
     # root never opens the owner's path; the owner's cat does
     if ! as_owner cat -- "$src/$d/snapshots/$commit/$file" >"$dest" 2>/dev/null </dev/null; then
-      rm -rf "$stage"; say "model: $d/snapshots/$commit/$file not readable in $src; model layer not installed"
-      return 1
+      # no cache: fetch pinned revision, digest decides
+      say "model: $file not in $src; downloading the pinned copy from huggingface.co"
+      if ! env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin curl -fsSL --retry 4 --retry-delay 5 --retry-all-errors \
+           --connect-timeout 20 -o "$dest" "https://huggingface.co/$repo/resolve/$commit/$file" </dev/null; then
+        rm -rf "$stage"; say "model: download of $file failed (no network?); model layer not installed"
+        return 1
+      fi
     fi
   done < <(model_manifest)
   chown -hR root:root "$stage"
@@ -2712,7 +2775,7 @@ dry_run_report() {
     say "rule       : NOT installed (default); your traffic is not diverted until you run arm"
   fi
   say "CA         : $([ -f "$USER_HOME/.mitmproxy/mitmproxy-ca.pem" ] && echo "copied from $USER_HOME/.mitmproxy" || echo "created new by mitmdump in $CONFDIR")"
-  [ "$with_model" = 1 ] || say "model      : NOT installed (default); free-form names pass unmasked; add --with-model"
+  [ "$with_model" = 1 ] || say "model      : NOT installed (--no-model); free-form names pass unmasked"
   [ "$with_model" = 1 ] && say "option     : the language-model layer is installed too; weights come from ${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub}, or are downloaded at their pinned commit, into $HFDIR if they match their pinned sha256"
   say ""
   say "after the real install, run:"
@@ -2731,12 +2794,14 @@ install_payload() {
   load_plan
   build_venv "$with_model"
   # no model degrades the proxy; install goes on
-  if [ "$with_model" = 1 ]; then
+  if [ "$with_model" = 1 ] && [ "${MODEL_DOWNGRADED:-0}" = 1 ]; then
+    say "WARNING: no model layer (its Python packages have no wheel here); free-form names pass unmasked"
+  elif [ "$with_model" = 1 ]; then
     install_model_cold "${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub}" \
       || say "WARNING: no model layer; free-form names that escape the regex rules pass unmasked"
   else
-    say "WARNING: model layer NOT installed (no --with-model): free-form names pass unmasked"
-    say "  regex, checksum and ATR rules still apply; add the model: guardrail-adm install --with-model"
+    say "WARNING: model layer NOT installed (--no-model): free-form names pass unmasked"
+    say "  regex, checksum and ATR rules still apply; add the model: guardrail-adm install"
   fi
   install_ca
   install_trust
@@ -2776,10 +2841,11 @@ install_boot_units() {
 }
 
 install_all() {
-  local with_model=0 persist=0 enable_units=0 dry=0 do_arm=0 dur=15m a
+  local with_model=1 persist=0 enable_units=0 dry=0 do_arm=0 dur=15m a
   for a in "$@"; do
     case "$a" in
       --with-model) with_model=1 ;;
+      --no-model) with_model=0 ;;
       --model-src=*) MODEL_SRC="${a#--model-src=}" ;;
       --no-deps) NO_DEPS=1 ;;
       --persist) persist=1 ;;
@@ -2883,7 +2949,7 @@ verify() {
         ok "model weights match their pinned checksums: $(describe "$HFDIR")"
         model_load_check
       else bad "model layer: $BAD"; fi
-    else note "model layer NOT installed: free-form names pass unmasked (regex and ATR rules still apply); install --with-model"; fi
+    else note "model layer NOT installed: free-form names pass unmasked (regex and ATR rules still apply); install without --no-model"; fi
   fi
   for p in "$LIBDIR" "$VENV" "$IAPP" "$RUNNER" "$CA_PUB"; do
     # the venv lives inside LIBDIR and always holds links
