@@ -804,7 +804,7 @@ ROLE_MAILBOX = re.compile(r"(?i)(?:no[-_.]?reply|do[-_.]?not[-_.]?reply)@[\w-]+(
 PII_RULES: list[tuple[str, re.Pattern]] = [
     # Bounded local part; the open form was quadratic.
     ("EMAIL", re.compile(r"\b[\w.+-]{1,254}@[\w-]+\.[\w.]{2,}\b")),
-    # Emails written as "budi (at) contoh (dot) test" or similar.
+    # Emails written as "name (at) domain (dot) tld" or similar.
     ("EMAIL_TERSAMAR", re.compile(r"[A-Za-z0-9._%+-]{1,64}\s*(?:\(at\)|\[at\]|@|\uff20)\s*"
                                   r"[A-Za-z0-9.-]{1,63}\s*(?:\(dot\)|\[dot\]|\.)\s*"
                                   r"[A-Za-z]{2,24}\b")),
@@ -859,14 +859,14 @@ GROUP_RULES: list[tuple[str, re.Pattern]] = [
                              r"(\"[^\"\n]{4,128}\"|'[^'\n]{4,128}'|[^\s'\"]{4,128})")),
     # Password in a connection address: postgres://admin:***@10.0.0.5
     ("KREDENSIAL_URL", re.compile(r"(?i)([a-z][a-z0-9+.\-]{1,20}://[^\s:@/]{1,64}:)([^\s@/]{3,64})(?=@)")),
-    # Short mysql password -pRahasia123; a bare number is a port.
+    # Short mysql password -pSwordfish123; a bare number is a port.
     ("SANDI_SINGKAT", re.compile(r"(?i)(?<![^\s\"'(])-p"
                                   r"(?:[ \t]*(['\"])(?=[^'\"\n]*\d)([^'\"\n]{4,64})\1"
                                   r"|(?=[^\s'\"]*\d)(?![\d:]+(?:\s|$))([^\s'\"]{4,64}))")),
     # Account number after an account word; the word is required.
     ("NOMOR_REKENING", re.compile(r"(?i)\b((?:(?:no\.?|nomor|nomer)\s*)?"
                                   r"(?:rekening|norek|account|akun|a/c)\b[^\d\n]{0,14})(\d{8,20})\b")),
-    # "password baru saya adalah Kucing2026!": mask only the value.
+    # "my new password is Swordfish2026!": mask only the value.
     ("SANDI_PANJANG", re.compile(r"(?i)(\b(?:password(?:nya)?|kata\s+sandi(?:nya)?|sandi(?:nya)?)\b"
                                  r"[^\n]{0,40}?)"
                                  # A quoted value may contain spaces; take it whole.
