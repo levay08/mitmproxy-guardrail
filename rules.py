@@ -101,6 +101,8 @@ PROFILE_MARK = "# guardrail-ca: added by " + ME + ", remove this line to undo"
 # Proxy packages; first is required, rest are optional layers.
 CORE_PACKAGES = ("mitmproxy", "pyyaml", "python-stdnum", "phonenumbers")
 MODEL_PACKAGES = ("gliner", "protobuf", "sentencepiece")
+# Import name per model package; a gap here is named before the loader hides it.
+MODEL_IMPORTS = (("google.protobuf", "protobuf"), ("sentencepiece", "sentencepiece"))
 
 
 def search_path() -> list:
@@ -3933,6 +3935,18 @@ def warm_up() -> dict:
     return out
 
 
+def _missing_model_import():
+    """Name the first model dependency that cannot be imported."""
+    import importlib.util as iu
+    for mod, pkg in MODEL_IMPORTS:
+        try:
+            if iu.find_spec(mod) is None:
+                return pkg
+        except (ImportError, ValueError):
+            return pkg
+    return ""
+
+
 def _load_model():
     """Load the model once. Failures are recorded, never raised."""
     global _model, _model_error, _load_seconds
@@ -3943,6 +3957,9 @@ def _load_model():
         try:
             from gliner import GLiNER  # imported here so the proxy stays light in off mode
 
+            gap = _missing_model_import()
+            if gap:
+                raise ImportError(f"required package '{gap}' is not importable")
             try:
                 _model = GLiNER.from_pretrained(MODEL_ID, local_files_only=True)
             except Exception:  # noqa: BLE001 - not cached yet, fetch once

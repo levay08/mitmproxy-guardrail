@@ -881,16 +881,31 @@ seed_endpoints() {
   py="$(dirname "$MITMDUMP")/python"
   [ "$DEV" = 1 ] && { who="$OWNER"; home="$APP"; }
   [ -x "$py" ] && [ -n "$who" ] || return 1
-  say "no endpoint list yet: resolving the watched hosts as $who"
+  say "resolving the watched hosts as $who"
   as_user "$who" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$home" GUARDRAIL_HOME="$home" \
     GUARDRAIL_CONFIG="$RUN_APP/guardrail.yaml" "$py" -I -c \
     'import sys; sys.path.insert(0, sys.argv[1]); import rules; sys.exit(0 if rules.ai_endpoint_ips() else 1)' \
     "$RUN_APP" >/dev/null 2>&1
 }
 
+# seconds an address list may age before arm resolves again
+ENDPOINT_MAX_AGE=86400
+
+# resolve again when the list is old; a failed refresh keeps the old list
+refresh_stale_endpoints() {
+  local f="$STATE/data/endpoint-ips.json" age
+  [ "$DEV" = 1 ] && f="$APP/data/endpoint-ips.json"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  age=$(( $(date +%s) - $(stat -c %Y -- "$f") ))
+  [ "$age" -gt "$ENDPOINT_MAX_AGE" ] || return 0
+  say "endpoint list is $((age / 3600)) h old: resolving the watched hosts again"
+  seed_endpoints || say "refresh failed (no DNS?): keeping the list from $(date -d "@$(stat -c %Y -- "$f")" '+%F %T')"
+}
+
 set_sync() {
   need_python
   local tmp
+  refresh_stale_endpoints
   tmp="$(mktemp -d)" || die "mktemp failed"
   sync_collect "$tmp" || { seed_endpoints && sync_collect "$tmp"; } || { rm -rf "$tmp"; die "no endpoint list: neither ${APP:-the project}/data nor $STATE/data has endpoint-ips.json"; }
   build_lists "${SYNC_SRCS[@]}" || { rm -rf "$tmp"; die "the address lists could not be built"; }
@@ -2366,6 +2381,32 @@ install_model() {
   say "model layer installed in $HFDIR ($(du -sh "$HFDIR" | cut -f1)), every file matches its pin"
 }
 
+# owner downloads each pinned file at its commit; the pins are checked after
+fetch_model() {
+  local dst="$1" repo commit file alg want f
+  command -v curl >/dev/null || { say "model: curl is missing, cannot download"; return 1; }
+  while read -r repo commit file alg want; do
+    f="$dst/models--${repo//\//--}/snapshots/$commit/$file"
+    as_owner mkdir -p -- "${f%/*}" </dev/null || return 1
+    say "model: downloading $repo/$file at $commit"
+    as_owner curl -fsSL --retry 3 --connect-timeout 20 --max-time 3600 -o "$f" \
+      "https://huggingface.co/$repo/resolve/$commit/$file" </dev/null \
+      || { say "model: download of $repo/$file failed (no network to huggingface.co?)"; return 1; }
+  done < <(model_manifest)
+}
+
+# owner cache first; with no --model-src, download the pinned files
+install_model_cold() {
+  local src="$1" dl
+  install_model "$src" && return 0
+  [ -z "$MODEL_SRC" ] || return 1
+  dl="$(as_owner mktemp -d </dev/null)" || return 1
+  say "model: owner cache has no usable copy; fetching the pinned files from huggingface.co"
+  if fetch_model "$dl" && install_model "$dl"; then as_owner rm -rf -- "$dl" </dev/null; return 0; fi
+  as_owner rm -rf -- "$dl" </dev/null
+  return 1
+}
+
 make_dirs() {
   local d
   [ -n "$OWNER_GROUP" ] || die "owner group unknown; cannot set the audit directory group"
@@ -2660,7 +2701,7 @@ dry_run_report() {
   fi
   say "CA         : $([ -f "$USER_HOME/.mitmproxy/mitmproxy-ca.pem" ] && echo "copied from $USER_HOME/.mitmproxy" || echo "created new by mitmdump in $CONFDIR")"
   [ "$with_model" = 1 ] || say "model      : NOT installed (default); free-form names pass unmasked; add --with-model"
-  [ "$with_model" = 1 ] && say "option     : the language-model layer is installed too; weights are copied from ${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub} into $HFDIR if they match their pinned sha256"
+  [ "$with_model" = 1 ] && say "option     : the language-model layer is installed too; weights come from ${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub}, or are downloaded at their pinned commit, into $HFDIR if they match their pinned sha256"
   say ""
   say "after the real install, run:"
   say "  bash $APP/run.sh verify"
@@ -2679,7 +2720,7 @@ install_payload() {
   build_venv "$with_model"
   # no model degrades the proxy; install goes on
   if [ "$with_model" = 1 ]; then
-    install_model "${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub}" \
+    install_model_cold "${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub}" \
       || say "WARNING: no model layer; free-form names that escape the regex rules pass unmasked"
   else
     say "WARNING: model layer NOT installed (no --with-model): free-form names pass unmasked"
