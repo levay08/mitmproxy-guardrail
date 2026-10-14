@@ -891,7 +891,7 @@ seed_endpoints() {
 # seconds an address list may age before arm resolves again
 ENDPOINT_MAX_AGE=86400
 
-# resolve again when the list is old; a failed refresh keeps the old list
+# resolve again when the list is old
 refresh_stale_endpoints() {
   local f="$STATE/data/endpoint-ips.json" age was
   [ "$DEV" = 1 ] && f="$APP/data/endpoint-ips.json"
@@ -900,7 +900,7 @@ refresh_stale_endpoints() {
   [ "$age" -gt "$ENDPOINT_MAX_AGE" ] || return 0
   was="$(stat -c %Y -- "$f")"
   say "endpoint list is $((age / 3600)) h old: resolving the watched hosts again"
-  # the resolver returns the old cache when DNS is down, so success is a new file time
+  # DNS down returns the old cache; check file time
   seed_endpoints && [ "$(stat -c %Y -- "$f" 2>/dev/null)" != "$was" ] \
     || say "refresh failed (no DNS?): keeping the list from $(date -d "@$was" '+%F %T')"
 }
@@ -2384,7 +2384,7 @@ install_model() {
   say "model layer installed in $HFDIR ($(du -sh "$HFDIR" | cut -f1)), every file matches its pin"
 }
 
-# owner downloads each pinned file at its commit; the pins are checked after
+# owner downloads pinned files; pins checked after
 fetch_model() {
   local dst="$1" repo commit file alg want f
   command -v curl >/dev/null || { say "model: curl is missing, cannot download"; return 1; }
@@ -2400,16 +2400,16 @@ fetch_model() {
   done < <(model_manifest)
 }
 
-# owner cache first; with no --model-src, download the pinned files
+# owner cache first, then download
 install_model_cold() {
   local src="$1" dl
-  # pins are fixed, so weights already in place need no second copy or download
+  # weights in place already match the pins
   if [ -z "$MODEL_SRC" ] && [ -d "$HFDIR" ] && tree_ok "$HFDIR" && model_check "$HFDIR"; then
     say "model layer already in $HFDIR, every file matches its pin"; return 0
   fi
   install_model "$src" && return 0
   [ -z "$MODEL_SRC" ] || return 1
-  # the owner's disk, not /tmp: that is often tmpfs, smaller than the 1.1 GB model
+  # owner disk, not tmpfs /tmp (model is 1.1 GB)
   as_owner mkdir -p -- "$USER_HOME/.cache" </dev/null
   as_owner find "$USER_HOME/.cache" -maxdepth 1 -name 'guardrail-model.*' -mmin +60 -exec rm -rf -- {} + </dev/null 2>/dev/null
   dl="$(as_owner mktemp -d -p "$USER_HOME/.cache" guardrail-model.XXXXXX </dev/null)" || return 1

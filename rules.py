@@ -101,7 +101,7 @@ PROFILE_MARK = "# guardrail-ca: added by " + ME + ", remove this line to undo"
 # Proxy packages; first is required, rest are optional layers.
 CORE_PACKAGES = ("mitmproxy", "pyyaml", "python-stdnum", "phonenumbers")
 MODEL_PACKAGES = ("gliner", "protobuf", "sentencepiece")
-# Import name per model package; a gap here is named before the loader hides it.
+# Import name per model package
 MODEL_IMPORTS = (("google.protobuf", "protobuf"), ("sentencepiece", "sentencepiece"))
 
 
