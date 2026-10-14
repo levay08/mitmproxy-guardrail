@@ -2231,8 +2231,9 @@ PY
 
 # root venv mirrors the project pins, wheels only
 build_venv() {
-  local with_model="$1" py out pins=() p keep_old
-  out="$(as_owner python3 -I "$IAPP/rules.py" venv-pins "$APP" ${with_model:+--with-model})" \
+  local with_model="$1" py out pins=() p keep_old mflag=()
+  [ "$with_model" = 1 ] && mflag=(--with-model)
+  out="$(as_owner python3 -I "$IAPP/rules.py" venv-pins "$APP" ${mflag[@]+"${mflag[@]}"})" \
     || die "cannot read the package versions of $APP/.venv"
   GR_PINS=(); GR_PIN_MISSING=(); GR_PIN_PYTHON=""
   eval "$out"
