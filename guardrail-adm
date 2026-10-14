@@ -524,36 +524,49 @@ sudoers_text() {
 #
 # Installed and validated by: visudo -c -f /etc/sudoers.d/guardrail
 # Undo: rm /etc/sudoers.d/guardrail
+# sudo-rs allows only a lone trailing *; last match wins.
+OWNER ALL=(root) PASSWD: /usr/local/sbin/guardrail-adm install, \
+    /usr/local/sbin/guardrail-adm install *, \
+    /usr/local/sbin/guardrail-adm uninstall, \
+    /usr/local/sbin/guardrail-adm uninstall *, \
+    /usr/local/sbin/guardrail-adm units-install, \
+    /usr/local/sbin/guardrail-adm units-install *, \
+    /usr/local/sbin/guardrail-adm rollback, \
+    /usr/local/sbin/guardrail-adm rollback *, \
+    /usr/local/sbin/guardrail-adm ca-trust, \
+    /usr/local/sbin/guardrail-adm ca-trust *, \
+    /usr/local/sbin/guardrail-adm ca-untrust, \
+    /usr/local/sbin/guardrail-adm ca-untrust *, \
+    /usr/local/sbin/guardrail-adm revoke, \
+    /usr/local/sbin/guardrail-adm revoke *, \
+    /usr/local/sbin/guardrail-adm arm *, \
+    /usr/local/sbin/guardrail-adm proxy-start *, \
+    /usr/local/sbin/guardrail-adm failsafe-test *, \
+    /usr/local/sbin/guardrail-adm endpoints *, \
+    /usr/local/sbin/guardrail-adm mode *
+# Passwordless: exact arguments only; anything else asks or is denied.
 OWNER ALL=(root) NOPASSWD: /usr/local/sbin/guardrail-adm status, \
     /usr/local/sbin/guardrail-adm detect, \
     /usr/local/sbin/guardrail-adm ca-status, \
     /usr/local/sbin/guardrail-adm verify, \
     /usr/local/sbin/guardrail-adm proxy-start, \
-    /usr/local/sbin/guardrail-adm proxy-start *, \
     /usr/local/sbin/guardrail-adm proxy-stop, \
     /usr/local/sbin/guardrail-adm arm, \
-    /usr/local/sbin/guardrail-adm arm *, \
+    /usr/local/sbin/guardrail-adm arm 5m, \
+    /usr/local/sbin/guardrail-adm arm 10m, \
+    /usr/local/sbin/guardrail-adm arm 15m, \
+    /usr/local/sbin/guardrail-adm arm 30m, \
+    /usr/local/sbin/guardrail-adm arm 45m, \
+    /usr/local/sbin/guardrail-adm arm 60m, \
+    /usr/local/sbin/guardrail-adm arm 1h, \
     /usr/local/sbin/guardrail-adm disarm, \
     /usr/local/sbin/guardrail-adm failsafe-fire, \
     /usr/local/sbin/guardrail-adm failsafe-test, \
-    /usr/local/sbin/guardrail-adm failsafe-test *, \
     /usr/local/sbin/guardrail-adm set-sync, \
     /usr/local/sbin/guardrail-adm endpoints, \
-    /usr/local/sbin/guardrail-adm endpoints *, \
-    /usr/local/sbin/guardrail-adm mode *, \
+    /usr/local/sbin/guardrail-adm mode neutral, \
+    /usr/local/sbin/guardrail-adm mode persistent, \
     /usr/local/sbin/guardrail-adm purge-logs
-# last match wins, so password rules go last
-# though it matches the lines above: anything with --dev or --long, and the verbs that
-# change what is installed.
-OWNER ALL=(root) PASSWD: /usr/local/sbin/guardrail-adm *--dev*, \
-    /usr/local/sbin/guardrail-adm *--long*, \
-    /usr/local/sbin/guardrail-adm install*, \
-    /usr/local/sbin/guardrail-adm uninstall*, \
-    /usr/local/sbin/guardrail-adm units-install*, \
-    /usr/local/sbin/guardrail-adm rollback*, \
-    /usr/local/sbin/guardrail-adm ca-trust*, \
-    /usr/local/sbin/guardrail-adm ca-untrust*, \
-    /usr/local/sbin/guardrail-adm revoke*
 POLICY
 }
 # old helper name; install and revoke remove it
