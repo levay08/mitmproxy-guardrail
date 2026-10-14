@@ -1,0 +1,3070 @@
+#!/usr/bin/env bash
+# Root helper, sudo-only; the proxy never runs as root.
+set -u
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin
+
+# --dev needed: sudo drops GR_DEV; mode is unsafe
+DEV=0
+LONG=0
+ARGS=()
+for a in "$@"; do case "$a" in --dev) DEV=1 ;; --long) LONG=1 ;; *) ARGS+=("$a") ;; esac; done
+[ "${GR_DEV:-0}" = 1 ] && DEV=1
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+# only SUDO_UID from caller; /etc/guardrail/helper.conf pins OWNER_UID, APP
+CONF=/etc/guardrail/helper.conf
+RECORD=/etc/guardrail/install.record
+SELF="$(readlink -f "$0")"
+# regular listener exists only for PAC clients using CONNECT
+PORT="${GUARDRAIL_PORT:-8899}"
+REGULAR_PORT="${GUARDRAIL_REGULAR_PORT:-8898}"
+LOG=/var/log/guardrail-adm.log
+PIDFILE=/run/guardrail-proxy.pid
+FSPID=/run/guardrail-failsafe.pid
+LIST=/run/guardrail-ai4.list
+LIST6=/run/guardrail-ai6.list
+LISTNAT=/run/guardrail-nat64.list
+UNIT=guardrail-failsafe
+UNITDIR=/etc/systemd/system
+USERUNITDIR=/etc/systemd/user
+PUSER=guardrail-proxy
+# Installed layout.
+LIBDIR=/usr/local/lib/guardrail
+VENV=$LIBDIR/venv
+IAPP=$LIBDIR/app
+HFDIR=$LIBDIR/hf
+RUNNER=$LIBDIR/bin/proxy-run
+CA_PUB=$LIBDIR/guardrail-ca.pem
+VARDIR=/var/lib/guardrail
+CONFDIR=$VARDIR/conf
+STATE=$VARDIR/state
+PACDIR=$VARDIR/pac
+LOGDIR=/var/log/guardrail
+PROXY_LOG=$LOGDIR/proxy.log
+# only these app files are copied to the proxy
+APP_FILES="guardrail.py rules.py router.py sweep.py panel.py watchdog.py notify_user.py requirements.txt guardrail.yaml atr data/dlp"
+CA_FILES="mitmproxy-ca.pem mitmproxy-ca-cert.pem mitmproxy-ca-cert.cer mitmproxy-ca-cert.p12 mitmproxy-ca.p12 mitmproxy-dhparam.pem"
+NFT="$(command -v nft || true)"
+HAS_SYSTEMD=0
+[ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 && HAS_SYSTEMD=1
+
+# Root-only log: created 0600, never carries history text.
+log() {
+  [ -w "$LOG" ] || [ "$(id -u)" -eq 0 ] || return 0
+  [ -e "$LOG" ] || [ "$(id -u)" -ne 0 ] || install -m 0600 /dev/null "$LOG" 2>/dev/null
+  [ -e "$LOG" ] || return 0
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"
+}
+say() { printf '%s\n' "$*"; log "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; log "error: $*"; exit 1; }
+
+# One key from a root-owned file nobody else can write.
+root_file_get() {
+  local f="$1" k="$2"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  [ "$(stat -c %u "$f")" = 0 ] || return 0
+  case "$(stat -c %A "$f")" in ?????w????|????????w?) return 0 ;; esac
+  sed -n "s/^$k=//p" "$f"
+}
+conf_get() { root_file_get "$CONF" "$1" | tail -1; }
+
+# owner = sudo caller; systemd units fall back to helper.conf
+UID_TARGET=""
+case "${SUDO_UID:-}" in ''|0|*[!0-9]*) ;; *) UID_TARGET="$SUDO_UID" ;; esac
+[ -n "$UID_TARGET" ] || UID_TARGET="$(conf_get OWNER_UID)"
+[ -n "$UID_TARGET" ] || { [ "$(id -u)" -ne 0 ] && UID_TARGET="$(id -u)"; }
+OWNER=""; USER_HOME=""; OWNER_GROUP=""
+if [ -n "$UID_TARGET" ]; then
+  OWNER="$(getent passwd "$UID_TARGET" | cut -d: -f1)"
+  USER_HOME="$(getent passwd "$UID_TARGET" | cut -d: -f6)"
+  OWNER_GROUP="$(id -gn "$UID_TARGET" 2>/dev/null)"
+fi
+
+# app source to copy: pinned in helper.conf, else under home
+APP="$(conf_get APP)"
+APP_NOTE="from $CONF"
+if [ -z "$APP" ] && [ -n "$USER_HOME" ]; then
+  found="$(find "$USER_HOME" -maxdepth 5 -path "$USER_HOME/.*" -prune -o \
+             -type f -path '*/llm-guardrail/guardrail.py' -print 2>/dev/null)"
+  if [ "$(printf '%s' "$found" | grep -c .)" = 1 ]; then
+    APP="$(dirname "$found")"; APP_NOTE="found under $USER_HOME"
+  else
+    APP_NOTE="not found: $(printf '%s' "$found" | grep -c .) copies of llm-guardrail/guardrail.py under $USER_HOME; pin one from the tree it sits in: sudo bash <tree>/llm-guardrail/guardrail-adm install"
+  fi
+fi
+if [ "$DEV" = 1 ]; then RUN_APP="$APP"; MITMDUMP="$APP/.venv/bin/mitmdump"
+else RUN_APP="$IAPP"; MITMDUMP="$VENV/bin/mitmdump"
+fi
+
+NO_DEPS=0
+MODEL_SRC=""
+
+need_owner() { [ -n "$OWNER" ] && [ "$UID_TARGET" != 0 ] || die "owner unknown: call through sudo, or pin OWNER_UID in $CONF"; }
+need_app() { need_owner; [ -n "$APP" ] && [ -f "$APP/guardrail.py" ] || die "app $APP_NOTE"; }
+need_nft() { [ -n "$NFT" ] || die "nft not found: install nftables"; }
+need_systemd() { [ "$HAS_SYSTEMD" = 1 ] || die "this verb needs systemd, which is not running here; nothing was changed"; }
+need_python() { command -v python3 >/dev/null 2>&1 || die "python3 not found"; }
+# visudo must exist before install writes the sudoers entry
+need_sudo_tool() { command -v visudo >/dev/null 2>&1 || die "visudo not found; install sudo first (e.g. apk add sudo)"; }
+
+# run as a user: runuser, setpriv or su, whichever exists
+as_user() {
+  local who="$1"; shift
+  # runuser can exist yet fail; try each tool once
+  if command -v runuser >/dev/null 2>&1 && runuser -u "$who" -- true 2>/dev/null; then
+    runuser -u "$who" -- "$@"
+  elif command -v setpriv >/dev/null 2>&1 \
+       && setpriv --reuid="$(id -u "$who")" --regid="$(id -g "$who")" --init-groups -- true 2>/dev/null; then
+    setpriv --reuid="$(id -u "$who")" --regid="$(id -g "$who")" --init-groups -- "$@"
+  elif command -v su >/dev/null 2>&1; then su -s /bin/sh "$who" -c "$(printf '%q ' "$@")"
+  else return 127
+  fi
+}
+as_owner() { as_user "$OWNER" "$@"; }
+as_puser() { as_user "$PUSER" "$@"; }
+
+# 15m, 15min, 20s, 20 -> seconds.
+to_seconds() {
+  local n="${1%%[a-z]*}" u="${1#"${1%%[a-z]*}"}"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  case "$u" in
+    ''|s|sec) echo "$n" ;;
+    m|min) echo $((n * 60)) ;;
+    h) echo $((n * 3600)) ;;
+    *) return 1 ;;
+  esac
+}
+
+failsafe_method() {
+  if [ "$HAS_SYSTEMD" = 1 ]; then echo systemd
+  elif command -v setsid >/dev/null 2>&1 && command -v sleep >/dev/null 2>&1; then echo background
+  else echo none
+  fi
+}
+
+# owner desktop and session bus, read from their processes
+owner_env() {
+  local p v
+  for p in /proc/[0-9]*; do
+    [ "$(stat -c %u "$p" 2>/dev/null)" = "$UID_TARGET" ] || continue
+    v="$(tr '\0' '\n' <"$p/environ" 2>/dev/null | sed -n "s/^$1=//p" | head -1)"
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  done
+  return 1
+}
+
+# which tool resets the owner desktop proxy, or none
+desktop_tool() {
+  local d; d="$(owner_env XDG_CURRENT_DESKTOP || owner_env DESKTOP_SESSION || true)"
+  d="$(printf '%s' "$d" | tr 'A-Z;' 'a-z:')"
+  DESKTOP="${d:-none}"; TOOL=""; SKIP=""
+  case ":$DESKTOP:" in
+    *:kde:*|*:plasma*)
+      TOOL="$(command -v kwriteconfig6 || command -v kwriteconfig5 || true)"
+      [ -n "$TOOL" ] || SKIP="KDE session without kwriteconfig5/6" ;;
+    *:gnome*|*:unity:*|*:budgie*|*:cinnamon:*|*:pantheon:*|*:mate:*)
+      TOOL="$(command -v gsettings || true)"
+      [ -n "$TOOL" ] || SKIP="$DESKTOP session without gsettings" ;;
+    *:xfce*)
+      if command -v gsettings >/dev/null 2>&1 && [ -n "$(owner_bus)" ] && as_owner env \
+           "DBUS_SESSION_BUS_ADDRESS=$(owner_bus)" gsettings writable org.gnome.system.proxy mode >/dev/null 2>&1; then
+        TOOL="$(command -v gsettings)"
+      else
+        SKIP="XFCE has no desktop proxy key in xfconf and the GNOME proxy schema is not usable"
+      fi ;;
+    :none:) SKIP="no desktop session for $OWNER" ;;
+    *) SKIP="desktop '$DESKTOP' has no proxy tool this helper knows" ;;
+  esac
+}
+
+owner_bus() {
+  if [ -S "/run/user/$UID_TARGET/bus" ]; then printf 'unix:path=%s' "/run/user/$UID_TARGET/bus"
+  else owner_env DBUS_SESSION_BUS_ADDRESS || true
+  fi
+}
+
+# Owner, group and mode of one path, for refusal messages.
+describe() { stat -c '%n (owner %U, group %G, mode %a)' "$1" 2>/dev/null || printf '%s (missing)' "$1"; }
+
+# parent groups treated as root: root staff adm syslog
+SYS_GROUPS="root staff adm syslog"
+
+# path and parents root-owned; group write only above for SYS_GROUPS
+chain_ok() {
+  local p start mode g
+  p="$(readlink -f "$1" 2>/dev/null)" || { BAD="$1 (cannot be resolved)"; return 1; }
+  [ -e "$p" ] || { BAD="$1 (missing)"; return 1; }
+  # "above": $1 is a parent dir, so parents' rule applies
+  start="$p"; [ "${2:-}" = above ] && start=""
+  while :; do
+    mode="$(stat -c %a "$p")"
+    if [ "$(stat -c %u "$p")" != 0 ] || [ $(( 8#$mode & 8#002 )) -ne 0 ]; then
+      BAD="$(describe "$p")"; return 1
+    fi
+    if [ $(( 8#$mode & 8#020 )) -ne 0 ]; then
+      g="$(stat -c %G "$p")"
+      case " $SYS_GROUPS " in *" $g "*) [ "$p" != "$start" ] ;; *) false ;; esac \
+        || { BAD="$(describe "$p"), writable by group $g"; return 1; }
+    fi
+    [ "$p" = / ] && return 0
+    p="$(dirname "$p")"
+  done
+}
+
+# Refuse copied paths linking outside the tree; tar follows links.
+ensure_no_outside_links() {
+  local root="$1" link p; shift
+  local -a paths=()
+  for p in "$@"; do paths+=("$root/$p"); done
+  [ "$#" -gt 0 ] || paths=("$root")
+  while IFS= read -r link; do
+    case "$(readlink -f "$link")" in
+      "$root"/*) ;;
+      *) BAD="symlink out of the tree: $link -> $(readlink -f "$link")"; return 1 ;;
+    esac
+  done < <(find "${paths[@]}" -type l 2>/dev/null)
+  return 0
+}
+
+
+# root-owned tree; links only inside it or to root's files
+tree_ok() {
+  local root="$1" allow_links="${2:-0}" hit l target
+  chain_ok "$root" || return 1
+  hit="$(find "$root" ! -type l \( ! -uid 0 -o -perm /022 \) -printf '%p (owner %u, mode %m)\n' 2>/dev/null | head -1)"
+  [ -z "$hit" ] || { BAD="$hit"; return 1; }
+  while IFS= read -r l; do
+    target="$(readlink -f -- "$l" 2>/dev/null || true)"
+    if [ -z "$target" ] || [ ! -e "$target" ]; then
+      BAD="$l (symlink that leads nowhere)"; return 1
+    fi
+    case "$target" in
+      "$root"/*) continue ;;               # a link inside the tree is fine
+    esac
+    # a venv may link out, but only to root-owned files
+    if [ "$allow_links" != 1 ]; then
+      BAD="$l -> $target (symlink inside the installed tree)"; return 1
+    fi
+    if [ "$(stat -c %u -- "$target" 2>/dev/null)" != 0 ]; then
+      BAD="$l -> $target (symlink to a file that is not root's)"; return 1
+    fi
+    [ -z "$(find "$target" -maxdepth 0 -perm /022 2>/dev/null)" ] \
+      || { BAD="$l -> $target (symlink to a writable file)"; return 1; }
+  done < <(find "$root" -type l 2>/dev/null)
+  return 0
+}
+
+# proxy dirs owned by the proxy user, parents root-only
+puser_dir_ok() {
+  local d="$1" mode="$2"
+  chain_ok "$(dirname "$d")" above || return 1
+  if [ -L "$d" ] || [ ! -d "$d" ]; then BAD="$d (missing or a symlink)"; return 1; fi
+  [ "$(stat -c '%U %a' "$d")" = "$PUSER $mode" ] || { BAD="$(describe "$d"), expected owner $PUSER mode $mode"; return 1; }
+}
+
+# audit dir: proxy owns it, the owner's group reads it
+audit_dir_ok() {
+  local d="$LOGDIR" mode
+  chain_ok "$(dirname "$d")" above || return 1
+  if [ -L "$d" ] || [ ! -d "$d" ]; then BAD="$d (missing or a symlink)"; return 1; fi
+  mode="$(stat -c %a "$d")"
+  [ "$(stat -c '%U %G' "$d")" = "$PUSER $OWNER_GROUP" ] \
+    || { BAD="$(describe "$d"), expected owner $PUSER group $OWNER_GROUP"; return 1; }
+  # setgid so new files inherit the group; nothing for others
+  [ "$mode" = 2750 ] || { BAD="$(describe "$d"), expected mode 2750"; return 1; }
+}
+
+puser_exists() { id -u "$PUSER" >/dev/null 2>&1; }
+
+detect() {
+  local fs
+  desktop_tool
+  fs="$(failsafe_method)"
+  echo "owner      : ${OWNER:-unknown} uid ${UID_TARGET:-?}"
+  echo "app        : ${APP:-none} ($APP_NOTE)"
+  echo "mode       : $([ "$DEV" = 1 ] && echo 'DEV (project tree runs as the proxy user, not safe)' || echo 'installed layout')"
+  echo "proxy user : $PUSER $(puser_exists && id "$PUSER" || echo '(missing)')"
+  echo "venv       : $VENV $([ -x "$VENV/bin/mitmdump" ] && echo present || echo missing)"
+  echo "app copy   : $IAPP $([ -f "$IAPP/guardrail.py" ] && echo present || echo missing)"
+  echo "previous app: $IAPP.prev $([ -f "$IAPP.prev/guardrail.py" ] && echo kept || echo none)"
+  echo "nft        : ${NFT:-NOT FOUND}"
+  echo "systemd    : $([ "$HAS_SYSTEMD" = 1 ] && echo running || echo 'not running or no systemctl')"
+  echo "failsafe   : $fs"
+  [ "$fs" = none ] && echo "             arm would refuse: no way to remove the rule on its own"
+  echo "desktop    : $DESKTOP -> ${TOOL:-skip: $SKIP}"
+  echo "session bus: $(owner_bus)"
+  echo "run as user: $(command -v runuser || command -v setpriv || command -v su || echo none)"
+}
+
+usage() {
+  cat <<EOF
+guardrail-adm <verb> [args] [--dev]
+  install [opts]         one-command install: proxy user, root venv, app copy, CA, trust, units,
+                         rule with failsafe, then verify. opts: --with-model [--model-src=DIR] --persist --failsafe=15m
+                         --arm also diverts traffic now (default: install only, arm later)
+                         --dry-run prints the plan for this device and changes nothing
+                         run from the project tree this also writes the helper, its sudoers entry
+                         and helper.conf first, then hands over to the installed copy
+  uninstall              undo install: rule, units, trust, NSS, env file, files, proxy user
+  requirements [--install]   check the prerequisite tools; install the missing ones
+  verify                 print and check user, venv, path owners, CA fingerprints, listeners, rule, timers
+  status                 who is listening, the rule, the timer, the last records
+  set-sync               refresh sets ai4/ai6 from the router findings and the proxy's own cache
+  endpoints [host...]    print the effective endpoint list, sources and absent hosts (read-only)
+  mode <neutral|persistent>  write the strictness the installed proxy reads ($STATE/mode)
+  proxy-start [user]     start the transparent proxy as $PUSER ('root' is accepted, never used)
+  proxy-stop             stop it again
+  arm [duration]         set + rule (proxy must already listen), with a failsafe that flushes it, then the watchdog
+                         failsafe 300s to 3600s; longer needs --long and a password
+  disarm                 flush the rule, then stop the failsafe timer and the watchdog
+  failsafe-test [secs]   prove the dead-man switch fires, then leave the rule off
+  units-install          write the systemd units for the installed layout (nothing enabled)
+  units-enable           let those units start at boot (off by default at install)
+  units-remove           remove them again
+  user-add               create the $PUSER system user
+  journal <unit>         last journal lines of one guardrail unit
+  seal-logs              chmod 0600 the proxy logs that hold request headers
+  purge-logs             delete the proxy logs left in /tmp by earlier runs
+  revoke                 remove the sudoers entry and this helper, ending root access
+  rollback               put the previous app copy back and drop the rule; uninstall (log kept) when none
+  ca-status              where the CA is and which stores trust it (read-only)
+  ca-trust               put the CA into the system, browser and runtime stores again
+  ca-untrust             take it out of them again; the install stays
+  detect                 what this host offers (read-only, also works without root)
+  --dev                  run the project tree instead of the installed copy. NOT SAFE: whoever can
+                         write the project tree controls the proxy and its CA key. Never the default.
+EOF
+}
+
+# Prerequisites live here, never in a file the caller names.
+requirements_lines() {
+  cat <<'REQ'
+bash|command:bash|bash|bash|bash|bash|bash
+python3|command:python3|python3|python3|python3|python3|python
+venv|module:ensurepip|python3|python3-venv|python3|python3|python
+pip|run:python3 -m pip --version|py3-pip|python3-pip|python3-pip|python3-pip|python-pip
+openssl|command:openssl|openssl|openssl|openssl|openssl|openssl
+curl|command:curl|curl|curl|curl|curl|curl
+nft|command:nft|nftables|nftables|nftables|nftables|nftables
+sudo|command:sudo|sudo|sudo|sudo|sudo|sudo
+ss|command:ss|iproute2|iproute2|iproute|iproute2|iproute2
+pgrep|command:pgrep|procps|procps|procps-ng|procps|procps-ng
+REQ
+}
+
+# Optional rows: missing never stops an install.
+requirements_optional_lines() {
+  cat <<'REQ'
+notify-send|command:notify-send|libnotify|libnotify-bin|libnotify|libnotify-tools|libnotify
+REQ
+}
+
+# Column of the family inside a requirement row.
+req_columns() {
+  case "$1" in
+    alpine) echo 3 ;;
+    debian) echo 4 ;;
+    fedora) echo 5 ;;
+    suse)   echo 6 ;;
+    arch)   echo 7 ;;
+    *)      echo "" ;;
+  esac
+}
+
+# One check: command, python module, or command exits 0.
+req_ok() {
+  local probe="${1#*:}"
+  case "$1" in
+    command:*) command -v "$probe" >/dev/null 2>&1 ;;
+    # a module name is checked, never pasted
+    module:*)  case "$probe" in
+                 *[!A-Za-z0-9_.]*|"") return 1 ;;
+                 *) python3 -I -c "import $probe" >/dev/null 2>&1 ;;
+               esac ;;
+    # one known shape, compared literally
+    run:*)     [ "$probe" = "python3 -m pip --version" ] && python3 -I -m pip --version >/dev/null 2>&1 ;;
+    *)         return 0 ;;
+  esac
+}
+
+# Every requirement that is not satisfied yet, as "name package".
+requirements_missing() {
+  local line name check pkg col src=requirements_lines
+  [ "${1:-}" = optional ] && src=requirements_optional_lines
+  col="$(req_columns "$(host_family)")"
+  while IFS= read -r line; do
+    name="$(printf '%s' "$line" | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); print $1}')"
+    check="$(printf '%s' "$line" | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')"
+    [ -n "$name" ] || continue
+    req_ok "$check" && continue
+    pkg=""
+    [ -n "$col" ] && pkg="$(printf '%s' "$line" | awk -F'|' -v c="$col" '{gsub(/[[:space:]]/,"",$c); print $c}')"
+    printf '%s %s\n' "$name" "${pkg:-$name}"
+  done < <("$src")
+}
+
+requirements_report() {
+  local missing opt cmd
+  missing="$(requirements_missing)"
+  opt="$(requirements_missing optional)"
+  if [ -n "$opt" ]; then
+    cmd="$(pkg_command "$(host_family)")"
+    say "optional tool missing: $(printf '%s' "$opt" | awk '{print $1}' | tr '\n' ' ')- desktop banners will not show${cmd:+; install: sudo $cmd $(printf '%s' "$opt" | awk '{print $2}' | tr '\n' ' ')}"
+  fi
+  if [ -z "$missing" ]; then
+    say "prerequisites complete on $(host_family)"
+    return 0
+  fi
+  say "prerequisites missing: $(printf '%s' "$missing" | awk '{print $1}' | tr '\n' ' ')"
+  return 1
+}
+
+# Install what the file says is missing, per family.
+requirements_install() {
+  local family pkgs cmd missing
+  family="$(host_family)"
+  [ -n "$family" ] || { say "distro family not recognised; install these yourself: $(requirements_lines | awk -F'|' '{gsub(/[[:space:]]/,"",$1); printf "%s ", $1}')"; return 1; }
+  missing="$(requirements_missing)"
+  [ -n "$missing" ] || return 0
+# live CD repos install nothing: repoint Alpine first
+  if [ "$family" = alpine ] && ! grep -qE "^https?://" /etc/apk/repositories 2>/dev/null; then
+    local rel; rel="$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null)"
+    if [ -n "$rel" ]; then
+      say "the apk repositories do not point at a network mirror yet; writing the official mirror for v$rel"
+      printf 'https://dl-cdn.alpinelinux.org/alpine/v%s/main\nhttps://dl-cdn.alpinelinux.org/alpine/v%s/community\n' "$rel" "$rel" >/etc/apk/repositories
+      apk update >/dev/null 2>&1
+    fi
+  fi
+  # the column comes from the owner's file: plain names only
+  pkgs="$(printf '%s' "$missing" | awk '{print $2}' \
+          | grep -xE '[A-Za-z0-9][A-Za-z0-9+_-]*(\.[A-Za-z0-9][A-Za-z0-9+_-]*)*' \
+          | grep -viE '\.(rpm|deb|apk|pkg\.tar)' | sort -u | tr '\n' ' ')"
+  [ -n "$pkgs" ] || { say "nothing installable in that list; check the prerequisite table"; return 1; }
+  cmd="$(pkg_command "$family")"
+  say "installing: $cmd $pkgs"
+  if ( cd / && $cmd $pkgs ) >/dev/null 2>&1; then
+    say "prerequisites installed"
+  else
+    say "installing the prerequisites FAILED. Run it yourself and retry: sudo $cmd $pkgs"
+    return 1
+  fi
+  return 0
+}
+
+pkg_command() {
+  case "$1" in
+    alpine)  echo "apk add --no-cache" ;;
+    debian)  echo "env DEBIAN_FRONTEND=noninteractive apt-get install -y" ;;
+    fedora)  echo "dnf install -y" ;;
+    suse)    echo "zypper --non-interactive install -y" ;;
+    arch)    echo "pacman -Sy --noconfirm" ;;
+    *)       echo "" ;;
+  esac
+}
+
+# Distro family: os-release first, else whichever package manager is present.
+host_family() {
+  local family="" b
+  if [ -r /etc/os-release ]; then
+    . /etc/os-release 2>/dev/null || true
+    case "${ID:-}${ID_LIKE:-}" in
+      *alpine*) family=alpine ;;
+      *debian*|*ubuntu*) family=debian ;;
+      *fedora*|*rhel*) family=fedora ;;
+      *suse*) family=suse ;;
+      *arch*) family=arch ;;
+    esac
+  fi
+  if [ -z "$family" ]; then
+    for b in apk apt-get dnf zypper pacman; do
+      command -v "$b" >/dev/null 2>&1 || continue
+      case "$b" in
+        apk) family=alpine ;; apt-get) family=debian ;; dnf) family=fedora ;;
+        zypper) family=suse ;; pacman) family=arch ;;
+      esac
+      break
+    done
+  fi
+  printf '%s' "$family"
+}
+
+# Prerequisites live in the table below; install what is missing.
+
+# One family's package list, from the file column.
+deps_for_family() {
+  local col; col="$(req_columns "$1")"
+  [ -n "$col" ] || return 0
+  requirements_lines | awk -F'|' -v c="$col" '{gsub(/[[:space:]]/,"",$c); printf "%s ", $c}'
+}
+
+# Read-only prerequisite check: allowed without root; --install needs it.
+if [ "${1:-}" = requirements ] && [ "${2:-}" != --install ]; then requirements_report; exit $?; fi
+if [ "${1:-}" = detect ]; then detect; exit 0; fi
+case "${1:-}" in ''|-h|--help|help) usage; exit 2 ;; esac
+# install --dry-run prints the plan, allowed without root
+case " $* " in *" --dry-run "*) DRY_OK=1 ;; *) DRY_OK=0 ;; esac
+if [ "$(id -u)" -ne 0 ] && [ "$DRY_OK" != 1 ]; then die "root only: sudo $0 ${1:-}"; fi
+
+# tree install: write helper, sudoers, conf, then hand over
+HELPER_PATH=/usr/local/sbin/guardrail-adm
+SUDOERS_FILE=/etc/sudoers.d/guardrail
+# keep PASSWD entries last: sudo takes the last match
+sudoers_text() {
+  cat <<'POLICY'
+# One root entry point, and a narrow list without a password.
+#
+# Why the list is narrow: a process running as the owner can ask sudo to do
+# anything in this file. If install, uninstall, units-install, rollback or revoke
+# or any call carrying --dev ran without a password, that process could
+# put its own code into the installed layout, and the installed code runs as the
+# proxy user, which holds the CA key. So those stay behind a password.
+#
+# Only verbs that act on the root-owned installed layout run without a password,
+# and each one nails the script path so no other program can be substituted.
+#
+# Installed and validated by: visudo -c -f /etc/sudoers.d/guardrail
+# Undo: rm /etc/sudoers.d/guardrail
+OWNER ALL=(root) NOPASSWD: /usr/local/sbin/guardrail-adm status, \
+    /usr/local/sbin/guardrail-adm detect, \
+    /usr/local/sbin/guardrail-adm ca-status, \
+    /usr/local/sbin/guardrail-adm verify, \
+    /usr/local/sbin/guardrail-adm proxy-start, \
+    /usr/local/sbin/guardrail-adm proxy-start *, \
+    /usr/local/sbin/guardrail-adm proxy-stop, \
+    /usr/local/sbin/guardrail-adm arm, \
+    /usr/local/sbin/guardrail-adm arm *, \
+    /usr/local/sbin/guardrail-adm disarm, \
+    /usr/local/sbin/guardrail-adm failsafe-fire, \
+    /usr/local/sbin/guardrail-adm failsafe-test, \
+    /usr/local/sbin/guardrail-adm failsafe-test *, \
+    /usr/local/sbin/guardrail-adm set-sync, \
+    /usr/local/sbin/guardrail-adm endpoints, \
+    /usr/local/sbin/guardrail-adm endpoints *, \
+    /usr/local/sbin/guardrail-adm mode *, \
+    /usr/local/sbin/guardrail-adm purge-logs
+# last match wins, so password rules go last
+# though it matches the lines above: anything with --dev or --long, and the verbs that
+# change what is installed.
+OWNER ALL=(root) PASSWD: /usr/local/sbin/guardrail-adm *--dev*, \
+    /usr/local/sbin/guardrail-adm *--long*, \
+    /usr/local/sbin/guardrail-adm install*, \
+    /usr/local/sbin/guardrail-adm uninstall*, \
+    /usr/local/sbin/guardrail-adm units-install*, \
+    /usr/local/sbin/guardrail-adm rollback*, \
+    /usr/local/sbin/guardrail-adm ca-trust*, \
+    /usr/local/sbin/guardrail-adm ca-untrust*, \
+    /usr/local/sbin/guardrail-adm revoke*
+POLICY
+}
+# old helper name; install and revoke remove it
+OLD_HELPER_PATH=/usr/local/sbin/guardrail-root
+self_install() {
+  local a helper_only=0 uid name here app tmp
+  local -a rest=()
+  for a in "$@"; do
+    case "$a" in --helper-only) helper_only=1 ;; *) rest+=("$a") ;; esac
+  done
+  uid="${SUDO_UID:-${PKEXEC_UID:-}}"
+  case "$uid" in ''|0|*[!0-9]*) die "run through sudo or pkexec from the owner's account" ;; esac
+  name="$(getent passwd "$uid" | cut -d: -f1)"
+  [ -n "$name" ] || die "no account with uid $uid"
+  here="$(cd "$(dirname "$SELF")" && pwd)"
+  app="$here"
+  # app may sit in a sibling folder: old layout fallback
+  [ -f "$app/guardrail.py" ] || app="$(dirname "$here")/llm-guardrail"
+  [ -f "$app/guardrail.py" ] || die "no app at $app; nothing was installed"
+  need_sudo_tool
+  install -d -o root -g root -m 0755 /usr/local/sbin
+  install -o root -g root -m 0755 "$SELF" "$HELPER_PATH"
+  install -d -o root -g root -m 0755 /etc/guardrail
+  printf 'OWNER_UID=%s\nAPP=%s\n' "$uid" "$app" >"$CONF"
+  chmod 0644 "$CONF"
+  tmp="$(mktemp)"
+  sudoers_text | sed "s/^OWNER /$name /" >"$tmp"
+  if visudo -c -f "$tmp" >/dev/null; then
+    install -o root -g root -m 0440 "$tmp" "$SUDOERS_FILE"
+    say "installed for $name (uid $uid), app $app"
+  else
+    rm -f "$tmp"
+    die "the generated sudoers entry did not validate; helper installed, sudoers not"
+  fi
+  rm -f "$tmp"
+  # drop the older /etc/sudoers.d/guardrail-test entry, or it lingers
+  if [ -e /etc/sudoers.d/guardrail-test ]; then
+    rm -f /etc/sudoers.d/guardrail-test && say "removed the older /etc/sudoers.d/guardrail-test"
+  fi
+  # remove the old guardrail-root copy; nothing updates it
+  if [ -e "$OLD_HELPER_PATH" ]; then
+    rm -f "$OLD_HELPER_PATH" && say "removed the older helper at $OLD_HELPER_PATH"
+  fi
+  [ "$helper_only" = 1 ] && exit 0
+  exec env SUDO_UID="$uid" SUDO_USER="$name" "$HELPER_PATH" install ${rest[@]+"${rest[@]}"}
+}
+log "call by ${SUDO_USER:-unknown}: $* $([ "$DEV" = 1 ] && echo '[dev]')"
+if [ "$DEV" = 1 ]; then
+  say "WARNING: --dev mode. The proxy runs code from $APP, which $OWNER can write."
+  say "WARNING: anyone who can write that tree controls the proxy and can read its CA key. Development only."
+fi
+
+proxy_up() {
+  command -v ss >/dev/null 2>&1 || die "ss not found: install iproute2"
+  ss -ltnH "sport = :$PORT" | grep -q .
+}
+
+# the regular listener is the one the PAC points at
+regular_up() {
+  ss -ltnH "sport = :$REGULAR_PORT" | grep -q .
+}
+
+# account names of processes listening on the port
+listener_users() {
+  local pid
+  for pid in $(ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
+    stat -c %U "/proc/$pid" 2>/dev/null
+  done | sort -u | tr '\n' ' '
+}
+
+# True when one of the given listener accounts is root.
+listener_is_root() { case " $1 " in *" root "*) return 0 ;; *) return 1 ;; esac; }
+
+# "owner:" takes their login group, not always same name
+chown_data() { [ -n "$APP" ] && [ -n "$OWNER" ] && [ -d "$APP/data" ] && chown -R "$OWNER:" "$APP/data" "$APP/logs" 2>/dev/null; return 0; }
+
+ensure_table() {
+  need_nft
+  $NFT list table inet guardrail >/dev/null 2>&1 || $NFT add table inet guardrail
+  $NFT list set inet guardrail ai4 >/dev/null 2>&1 \
+    || $NFT add set inet guardrail ai4 '{ type ipv4_addr; flags interval; }'
+  $NFT list set inet guardrail ai6 >/dev/null 2>&1 \
+    || $NFT add set inet guardrail ai6 '{ type ipv6_addr; flags interval; }'
+  $NFT list set inet guardrail nat64 >/dev/null 2>&1 \
+    || $NFT add set inet guardrail nat64 '{ type ipv6_addr; flags interval; }'
+  $NFT list chain inet guardrail divert >/dev/null 2>&1 \
+    || $NFT 'add chain inet guardrail divert { type nat hook output priority -100; policy accept; }'
+  # nat chains cannot reject: QUIC reject needs a filter chain
+  $NFT list chain inet guardrail quic >/dev/null 2>&1 \
+    || $NFT 'add chain inet guardrail quic { type filter hook output priority -150; policy accept; }'
+}
+
+# read one cache; outcome noted for endpoints
+sync_read() {
+  local who="$1" kind="$2" label="$3" src="$4" dst="$5"
+  if as_user "$who" cat "$src" >"$dst" 2>/dev/null; then
+    SYNC_SRCS+=("$kind:$dst"); SYNC_NOTES+=("$kind|$label|$src|ok|$dst")
+  else
+    # a path that cannot be searched is unreadable, not absent
+    case "$(LC_ALL=C stat -- "$src" 2>&1)" in
+      *"No such file"*) SYNC_NOTES+=("$kind|$label|$src|absent|") ;;
+      *) SYNC_NOTES+=("$kind|$label|$src|unreadable as $who|") ;;
+    esac
+  fi
+}
+
+# collect endpoint JSON into a root-only temp dir
+sync_collect() {
+  local tmp="$1"
+  SYNC_SRCS=()
+  SYNC_NOTES=()
+  # read as the owner into root-only tmp; symlinks cannot mislead
+  if [ -n "$APP" ] && [ -n "$OWNER" ] && [ "$UID_TARGET" != 0 ]; then
+    sync_read "$OWNER" ep owner-cache "$APP/data/endpoint-ips.json" "$tmp/router.json"
+    sync_read "$OWNER" pr providers "$APP/data/provider-addresses.json" "$tmp/providers.json"
+  fi
+  if puser_exists; then
+    sync_read "$PUSER" ep proxy-cache "$STATE/data/endpoint-ips.json" "$tmp/proxy.json"
+  else
+    SYNC_NOTES+=("ep|proxy-cache|$STATE/data/endpoint-ips.json|absent: no $PUSER user|")
+  fi
+  [ "${#SYNC_SRCS[@]}" -gt 0 ]
+}
+
+# build $LIST, $LIST6 and $LISTNAT from kind:path specs in $@
+build_lists() {
+  # typed sets: v4 and v6 split; -I isolates the interpreter
+  # NAT64_SITE: venv libs, so PyYAML is found without the venv python
+  rm -f "$LIST6.skipped"  # a dead build must not leave a stale count
+  NAT64_CFG="${RUN_APP:+$RUN_APP/guardrail.yaml}" NAT64_OUT="${LISTNAT:-}" \
+    NAT64_SITE="${VENV:+$VENV/lib}" python3 -I - "$LIST" "$LIST6" "$@" <<'PY'
+import glob, ipaddress, json, os, sys
+
+out4, out6 = sys.argv[1:3]
+outnat = os.environ.get("NAT64_OUT", "")
+v4, v6, dropped, hosts = set(), set(), 0, 0
+
+def take(addrs):
+    global dropped
+    for a in addrs if isinstance(addrs, list) else []:
+        try:
+            ip = ipaddress.ip_address(str(a))
+        except ValueError:
+            dropped += 1
+            continue
+        (v6 if ip.version == 6 else v4).add(str(ip))
+
+for spec in sys.argv[3:]:
+    kind, path = spec.split(":", 1)
+    try:
+        data = json.load(open(path))
+    except Exception:
+        sys.exit(f"cannot read {kind} list")
+    if kind == "ep" and isinstance(data, dict):
+        for addrs in data.values():
+            hosts += 1
+            take(addrs)
+    elif kind == "pr" and isinstance(data, dict):
+        for entry in data.get("resolved", []):
+            hosts += 1
+            take(entry.get("addresses", []))
+        for entry in data.get("resolved_v6", []):
+            take(entry.get("addresses_v6", []))
+
+def global_v6():
+    """True when an interface has a global IPv6 address."""
+    try:
+        path = os.environ.get("GUARDRAIL_IF_INET6", "/proc/net/if_inet6")
+        return any(line[:1] in ("2", "3") for line in open(path))
+    except OSError:
+        return True
+
+# dead v6 uplink hangs clients; reset sends them to IPv4
+no_v6 = not global_v6()
+skipped_v6 = len(v6) if no_v6 else 0
+if no_v6:
+    v6.clear()
+
+WKP = "64:ff9b::/96"
+NAT64_LENS = (32, 40, 48, 56, 64, 96)
+
+
+def nat64_prefixes():
+    """Valid NAT64 prefixes from guardrail.yaml, plus a note per skipped entry."""
+    notes, cfg = [], os.environ.get("NAT64_CFG", "")
+    raw = None
+    if cfg:
+        try:
+            if not os.path.exists(cfg):
+                raise FileNotFoundError("not found")
+            if os.path.islink(cfg) or not os.path.isfile(cfg) or os.path.getsize(cfg) > 1 << 20:
+                raise ValueError("not a plain file under 1 MiB")
+            try:
+                import yaml
+            except ImportError:
+                site = os.environ.get("NAT64_SITE", "")
+                sys.path[:0] = glob.glob(site + "/python3*/site-packages") if site else []
+                import yaml
+            doc = yaml.safe_load(open(cfg, encoding="utf-8")) or {}
+            raw = doc.get("nat64_prefixes") if isinstance(doc, dict) else None
+        except Exception as exc:
+            # the type only: a parse error text can quote the file
+            notes.append(f"nat64_prefixes: {cfg} not read ({type(exc).__name__}); default {WKP} used")
+    if raw is None:
+        return [ipaddress.ip_network(WKP)], notes
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        notes.append(f"nat64_prefixes: must be a list, got {type(raw).__name__}; default {WKP} used")
+        return [ipaddress.ip_network(WKP)], notes
+    good = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            notes.append(f"nat64_prefixes: skipped {entry!r}: not a string")
+            continue
+        text = entry.strip()
+        try:
+            net = ipaddress.ip_network(text, strict=True)
+        except ValueError as exc:
+            notes.append(f"nat64_prefixes: skipped {text!r}: {exc}")
+            continue
+        if net.version != 6:
+            notes.append(f"nat64_prefixes: skipped {text!r}: IPv4, a NAT64 prefix is IPv6")
+        elif net.prefixlen not in NAT64_LENS:
+            notes.append(f"nat64_prefixes: skipped {text!r}: /{net.prefixlen} is not one of "
+                         "/32 /40 /48 /56 /64 /96 (RFC 6052)")
+        elif net.is_multicast or net.is_loopback or net.is_link_local or net.is_unspecified:
+            notes.append(f"nat64_prefixes: skipped {text!r}: not a routable unicast range")
+        else:
+            outer = next((g for g in good if net.subnet_of(g)), None)
+            if outer is not None:
+                notes.append(f"nat64_prefixes: skipped {text!r}: already covered by {outer}")
+                continue
+            for inner in (g for g in good if g.subnet_of(net)):
+                notes.append(f"nat64_prefixes: skipped {str(inner)!r}: covered by {net}")
+            good = [g for g in good if not g.subnet_of(net)] + [net]
+    if not good:
+        notes.append(f"nat64_prefixes: no usable entry; default {WKP} used")
+        good = [ipaddress.ip_network(WKP)]
+    return good, notes
+
+
+def nat64_form(net, a):
+    """The RFC 6052 address of IPv4 a inside prefix net (u octet 8 stays zero)."""
+    out = bytearray(net.network_address.packed)
+    idx = net.prefixlen // 8
+    for octet in ipaddress.IPv4Address(a).packed:
+        if idx == 8:
+            idx += 1
+        out[idx] = octet
+        idx += 1
+    return str(ipaddress.IPv6Address(bytes(out)))
+
+
+# DNS64 clients dial <prefix>+<v4>; map watched v4 into ai6
+prefixes, nat_notes = nat64_prefixes()
+nat64 = set() if no_v6 else {nat64_form(n, a) for n in prefixes for a in v4}
+open(out4, "w").write(", ".join(sorted(v4)))
+open(out6, "w").write(", ".join(sorted(v6 | nat64)))
+open(out6 + ".skipped", "w").write(f"{int(no_v6)} {skipped_v6}\n")
+if outnat:
+    open(outnat, "w").write(", ".join(str(n) for n in sorted(prefixes)))
+for note in nat_notes:
+    print(note)
+print(f"{len(v4)} v4 + {len(v6)} v6 addresses from {hosts} host entries in {len(sys.argv) - 3} files, "
+      f"{dropped} dropped as invalid" + (f", {skipped_v6} v6 skipped: no global IPv6 address" if no_v6 else "")
+      + (f", {len(nat64)} NAT64 forms of the v4 set added to ai6 "
+         f"from {len(prefixes)} prefix(es): {', '.join(str(n) for n in sorted(prefixes))}" if nat64 else ""))
+PY
+}
+
+# Write the built lists into the typed nft sets.
+apply_sets() {
+  ensure_table
+  # One transaction: a half-filled set never replaces a working one.
+  local tmp
+  tmp="$(mktemp)" || die "mktemp failed"
+  {
+    printf 'flush set inet guardrail ai4\n'
+    printf 'add element inet guardrail ai4 { %s }\n' "$(cat "$LIST")"
+    printf 'flush set inet guardrail ai6\n'
+    [ -s "$LIST6" ] && printf 'add element inet guardrail ai6 { %s }\n' "$(cat "$LIST6")"
+    printf 'flush set inet guardrail nat64\n'
+    [ -s "${LISTNAT:-}" ] && printf 'add element inet guardrail nat64 { %s }\n' "$(cat "$LISTNAT")"
+  } > "$tmp"
+  if $NFT -f "$tmp"; then
+    say "set ai4 refreshed from $(tr ',' '\n' < "$LIST" | grep -c '[0-9]') addresses"
+    if [ -s "$LIST6" ]; then
+      say "set ai6 refreshed from $(tr ',' '\n' < "$LIST6" | grep -c '[0-9a-fA-F]') addresses"
+    else
+      local flag="" skipped=0
+      read -r flag skipped <"$LIST6.skipped" 2>/dev/null || true
+      if [ "$flag" = 1 ]; then
+        say "set ai6 empty by design: no global IPv6 address on this host, $skipped v6 skipped; AI v6 is reset so clients use IPv4"
+      else
+        say "set ai6 left empty: the endpoint lists hold no IPv6 addresses"
+      fi
+    fi
+  else
+    rm -f "$tmp"
+    die "the address sets could not be replaced: the previous sets are untouched, so nothing changed"
+  fi
+  rm -f "$tmp"
+  if ! $NFT list set inet guardrail ai4 2>/dev/null | grep -qE 'elements = |elements = \{'; then
+    die "the ai4 set came out empty: nothing would be diverted"
+  fi
+}
+
+set_sync() {
+  need_python
+  local tmp
+  tmp="$(mktemp -d)" || die "mktemp failed"
+  sync_collect "$tmp" || { rm -rf "$tmp"; die "no endpoint list: neither ${APP:-the project}/data nor $STATE/data has endpoint-ips.json"; }
+  build_lists "${SYNC_SRCS[@]}" || { rm -rf "$tmp"; die "the address lists could not be built"; }
+  rm -rf "$tmp"
+  [ -s "$LIST" ] || die "the address list came out empty"
+  apply_sets
+}
+
+# read-only: the list set_sync would build, per host, with sources
+endpoints() {
+  need_python
+  local tmp h built=0 rc
+  local -a extra=()
+  for h in "$@"; do
+    case "$h" in ''|*[!A-Za-z0-9.-]*) die "not a host name; give plain names such as api.example.com" ;; esac
+    extra+=("$h")
+  done
+  tmp="$(mktemp -d)" || die "mktemp failed"
+  sync_collect "$tmp" || true
+  printf '%s\n' "${SYNC_NOTES[@]}" >"$tmp/notes"
+  # the real lists stay as the last arm left them
+  local old4="$LIST" old6="$LIST6" LIST="$tmp/ai4" LIST6="$tmp/ai6" LISTNAT="$tmp/nat"
+  if [ "${#SYNC_SRCS[@]}" -gt 0 ]; then
+    build_lists "${SYNC_SRCS[@]}" >"$tmp/build.txt" 2>&1 && built=1
+  fi
+  : >>"$tmp/build.txt"; : >>"$LIST"; : >>"$LIST6"
+  ENDPOINTS_BUILT="$built" ENDPOINTS_SITE="${VENV:+$VENV/lib}" python3 -I - \
+    "$tmp/notes" "$LIST" "$LIST6" "$old4" "$old6" "$tmp/build.txt" \
+    "${RUN_APP:+$RUN_APP/guardrail.yaml}" ${extra[@]+"${extra[@]}"} <<'PY'
+import glob, ipaddress, json, os, re, sys, time
+
+notes_file, new4, new6, old4, old6, build_txt, cfg = sys.argv[1:8]
+extras = sys.argv[8:]
+built = os.environ.get("ENDPOINTS_BUILT") == "1"
+NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+def when(path):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime(os.stat(path).st_mtime))
+    except OSError:
+        return "time unknown"
+
+
+def words(path):
+    try:
+        return {w.strip() for w in open(path).read().split(",") if w.strip()}
+    except OSError:
+        return None
+
+
+def fixed_hosts(pattern):
+    """Literal host names a provider pattern can name; mirrors rules.py."""
+    text = pattern.strip().lstrip("^").rstrip("$").replace("\\.", "\x00")
+    variants = [text]
+    group = re.compile(r"\((?:\?:)?([^()]*)\)(\?)?")
+    for _ in range(4):
+        grown, changed = [], False
+        for variant in variants:
+            hit = group.search(variant)
+            if not hit:
+                grown.append(variant)
+                continue
+            changed = True
+            options = hit.group(1).split("|") + ([""] if hit.group(2) else [])
+            grown += [variant[:hit.start()] + o + variant[hit.end():] for o in options]
+        variants = list(dict.fromkeys(grown))[:16]
+        if not changed:
+            break
+    out = []
+    for variant in variants:
+        for expanded in ([variant] if "?" not in variant else
+                         [re.sub(r"(.)\?", r"\1", variant, count=1), re.sub(r".\?", "", variant, count=1)]):
+            plain = expanded.replace("\x00", ".")
+            if re.search(r"[\[\](){}*+?|^$\\]", plain) or "." not in plain or plain.startswith(".") or ".." in plain:
+                continue
+            out.append(plain)
+    return list(dict.fromkeys(out))
+
+
+hosts, bad_names, bad_addrs = {}, 0, 0
+
+
+def add(label, name, addrs):
+    global bad_names, bad_addrs
+    if not isinstance(name, str) or not NAME.match(name):
+        bad_names += 1
+        return
+    ent = hosts.setdefault(name.lower(), {"src": set(), "v4": set(), "v6": set()})
+    ent["src"].add(label)
+    for a in addrs if isinstance(addrs, list) else []:
+        try:
+            ip = ipaddress.ip_address(str(a))
+        except ValueError:
+            bad_addrs += 1
+            continue
+        ent["v6" if ip.version == 6 else "v4"].add(str(ip))
+
+
+print("endpoints: read-only; same collection and parser as arm and set-sync")
+print("== sources")
+rc, readable = 0, 0
+for line in open(notes_file):
+    if "|" not in line:
+        continue
+    kind, label, path, status, tmp = line.rstrip("\n").split("|", 4)
+    count = ""
+    if status == "ok":
+        try:
+            data = json.load(open(tmp))
+            before = len(hosts)
+            if kind == "ep" and isinstance(data, dict):
+                for name, addrs in data.items():
+                    add(label, name, addrs)
+            elif kind == "pr" and isinstance(data, dict):
+                for entry in data.get("resolved", []):
+                    add(label, entry.get("host"), entry.get("addresses", []))
+                for entry in data.get("resolved_v6", []):
+                    add(label, entry.get("host"), entry.get("addresses_v6", []))
+            readable += 1
+            count = f"  {len(hosts) - before} new hosts"
+        except Exception:
+            status = "unparseable (arm would stop here)"
+    if status.startswith("unreadable") or status.startswith("unparseable"):
+        rc = 1
+    stamp = when(path) if status == "ok" else ""
+    print(f"  {label:<12} {status:<26} {stamp:<28} {path}{count}")
+if readable == 0:
+    rc = 1
+    print("  no cache could be read: nothing below describes what arm would use")
+
+v4 = {a for e in hosts.values() for a in e["v4"]}
+v6 = {a for e in hosts.values() for a in e["v6"]}
+print(f"== effective list: {len(hosts)} hosts, {len(v4)} v4 and {len(v6)} v6 addresses"
+      + (f"; {bad_names} names and {bad_addrs} addresses dropped as invalid" if bad_names or bad_addrs else ""))
+for name in sorted(hosts):
+    e = hosts[name]
+    addrs = " ".join(sorted(e["v4"])) + (" | " if e["v4"] and e["v6"] else "") + " ".join(sorted(e["v6"]))
+    print(f"  {name}  [{','.join(sorted(e['src']))}]  {len(e['v4'])}v4 {len(e['v6'])}v6  {addrs}")
+
+print("== expected hosts")
+patterns, why = [], ""
+try:
+    if not cfg:
+        raise ValueError("no guardrail.yaml path")
+    if os.path.islink(cfg) or not os.path.isfile(cfg) or os.path.getsize(cfg) > 1 << 20:
+        raise ValueError("not a plain file under 1 MiB")
+    try:
+        import yaml
+    except ImportError:
+        site = os.environ.get("ENDPOINTS_SITE", "")
+        sys.path[:0] = glob.glob(site + "/python3*/site-packages") if site else []
+        import yaml
+    doc = yaml.safe_load(open(cfg, encoding="utf-8")) or {}
+    raw = doc.get("providers") if isinstance(doc, dict) else None
+    patterns = [p for p in raw if isinstance(p, str)] if isinstance(raw, list) else []
+    print(f"  from the providers list in {cfg} and {len(extras)} name(s) on the command line")
+except Exception as exc:
+    why = type(exc).__name__
+    print(f"  providers list NOT read ({why}); only the {len(extras)} name(s) on the command line are checked")
+expected = list(extras)
+for pat in patterns:
+    found = [h for h in fixed_hosts(pat) if not h.startswith("127.")]
+    if not found and not pat.startswith("127"):
+        print(f"  pattern  {pat}  no fixed host name; cannot be checked by name")
+    expected += found
+absent = []
+gap = ("; a source above was unreadable, so this may be a read gap" if rc == 1 else "")
+for name in dict.fromkeys(h.lower() for h in expected):
+    e = hosts.get(name)
+    n = len(e["v4"]) + len(e["v6"]) if e else 0
+    if n:
+        print(f"  present  {name}  {n} addresses")
+    else:
+        absent.append(name)
+        print(f"  ABSENT   {name}  {'listed with no address' if e else 'not in any cache that was read'}{gap}")
+
+print("== against the build arm and set-sync wrote last")
+summary = [ln for ln in open(build_txt).read().splitlines() if ln.strip()]
+for ln in summary:
+    print(f"  fresh build: {ln}")
+if not built:
+    print("  fresh build: not run (no readable cache, or the build failed)")
+else:
+    nv4 = words(new4) or set()
+    nv6 = words(new6) or set()
+    print(f"  per-host listing vs fresh build: v4 {'agree' if nv4 == v4 else 'DIFFER'}; "
+          f"v6 {'agree' if v6 <= nv6 else 'listing has ' + str(len(v6 - nv6)) + ' not in the build (no global IPv6 uplink drops them)'}")
+    for fam, fresh, path in (("v4", nv4, old4), ("v6", nv6, old6)):
+        last = words(path)
+        if last is None:
+            print(f"  {fam}: no earlier build in {path} (nothing armed or synced since boot)")
+            continue
+        add_, gone = sorted(fresh - last), sorted(last - fresh)
+        verdict = "same as the fresh list" if not add_ and not gone else "DIFFERS from the fresh list"
+        print(f"  {fam}: last build {when(path)}, {len(last)} addresses, {verdict}")
+        if add_:
+            print(f"     in the caches now, not in the last build ({len(add_)}): {' '.join(add_[:20])}")
+        if gone:
+            print(f"     in the last build, not in the caches now ({len(gone)}): {' '.join(gone[:20])}")
+print("== what this cannot show")
+print("  it does not read the live nft sets, only /run lists, and not hosts a client resolves later")
+print("  an address the cache holds for a name says nothing about who else shares that address")
+if absent and rc == 0:
+    rc = 3
+print(f"result: {'ok' if rc == 0 else 'sources unreadable' if rc == 1 else str(len(absent)) + ' expected host(s) absent'}")
+sys.exit(rc)
+PY
+  rc=$?
+  rm -rf "$tmp"
+  return "$rc"
+}
+
+# nft lists "counter packets N bytes M" before the verdict
+CNT_RE='counter( packets [0-9]+ bytes [0-9]+)?'
+
+# nft answers and has no guardrail table
+nft_absent() {
+  local t
+  [ -n "$NFT" ] || return 1
+  t="$($NFT list tables 2>/dev/null)" || return 1
+  ! grep -q "inet guardrail" <<<"$t"
+}
+
+# 0 match, 1 no match, 2 nft unreadable
+chain_has() {
+  local out
+  [ -n "$NFT" ] || return 2
+  out="$($NFT list chain inet guardrail "$1" 2>/dev/null)" || return 2
+  grep -qE "meta skuid $UID_TARGET .*$2" <<<"$out"
+}
+
+# 0 both families divert, 1 not, 2 unreadable
+rule_present() {
+  local r4=0 r6=0
+  chain_has divert "ip daddr @ai4 $CNT_RE redirect to :$PORT\$" || r4=$?
+  chain_has divert "ip6 daddr @ai6 $CNT_RE redirect to :$PORT\$" || r6=$?
+  if [ "$r4" = 0 ] && [ "$r6" = 0 ]; then return 0; fi
+  if [ "$r4" = 2 ] || [ "$r6" = 2 ]; then
+    nft_absent && return 1
+    return 2
+  fi
+  return 1
+}
+
+add_rule() {
+  need_owner
+  ensure_table
+  $NFT flush chain inet guardrail divert
+  $NFT add rule inet guardrail divert meta skuid "$UID_TARGET" tcp dport 443 \
+    ip daddr @ai4 counter redirect to ":$PORT"
+  $NFT add rule inet guardrail divert meta skuid "$UID_TARGET" tcp dport 443 \
+    ip6 daddr @ai6 counter redirect to ":$PORT"
+  # no QUIC proxy: reject so clients fall back to TCP
+  $NFT flush chain inet guardrail quic
+  $NFT add rule inet guardrail quic meta skuid "$UID_TARGET" udp dport 443 \
+    ip daddr @ai4 counter reject
+  $NFT add rule inet guardrail quic meta skuid "$UID_TARGET" udp dport 443 \
+    ip6 daddr @ai6 counter reject
+  # empty nat64 set: keep the well-known prefix exempt, as before
+  $NFT list set inet guardrail nat64 | grep -q 'elements = ' \
+    || $NFT add element inet guardrail nat64 '{ 64:ff9b::/96 }'
+  # QUIC like TCP: v6 outside ai6 must not depend on set contents
+  $NFT add rule inet guardrail quic meta skuid "$UID_TARGET" udp dport 443 \
+    ip6 daddr != @ai6 ip6 daddr != @nat64 counter reject
+  # reset real AAAA outside ai6; NAT64 prefixes outside ai6 pass
+  $NFT add rule inet guardrail quic meta skuid "$UID_TARGET" tcp dport 443 \
+    ip6 daddr != @ai6 ip6 daddr != @nat64 counter reject with tcp reset
+  # a failed add is not an installed rule
+  local chain
+  for chain in divert quic; do
+    $NFT list chain inet guardrail "$chain" >/dev/null 2>&1 \
+      || die "chain $chain is missing; nothing would be diverted. Check: $NFT list chain inet guardrail $chain"
+  done
+  local cnt="$CNT_RE"
+  chain_has divert "ip daddr @ai4 $cnt redirect to :$PORT\$" \
+    || die "the IPv4 redirect is not in the chain: nothing would be diverted"
+  chain_has divert "ip6 daddr @ai6 $cnt redirect to :$PORT\$" \
+    || die "the IPv6 redirect is not in the chain: nothing would be diverted"
+  chain_has quic "ip daddr @ai4 $cnt reject" \
+    || die "the QUIC reject for IPv4 is missing: UDP 443 would leave the guardrail"
+  chain_has quic "ip6 daddr @ai6 $cnt reject" \
+    || die "the QUIC reject for IPv6 is missing: UDP 443 would leave the guardrail"
+  chain_has quic "udp dport 443 ip6 daddr != @ai6 ip6 daddr != @nat64 $cnt reject" \
+    || die "the v6 QUIC reject outside ai6 is missing: UDP 443 over v6 would leave the guardrail"
+  chain_has quic "tcp dport 443 ip6 daddr != @ai6 ip6 daddr != @nat64 $cnt reject with tcp reset" \
+    || die "the IPv6 TCP reject is missing: real-AAAA hosts would hang on a dead IPv6 uplink"
+  say "rule installed for uid $UID_TARGET on port 443 (tcp redirect + udp/quic reject, ipv4 and ipv6)"
+}
+
+arm_failsafe() {
+  local dur="${1:-15min}" secs pid
+  case "$dur" in *[!0-9a-z]*) die "bad duration: $dur" ;; esac
+  case "$dur" in [0-9]*) ;; *) die "bad duration: $dur" ;; esac
+  secs="$(to_seconds "$dur")" || die "bad duration: $dur"
+  case "$(failsafe_method)" in
+    systemd) ;;
+    background)
+      # no systemd: detached sleeper must be alive before add_rule
+      if [ -f "$FSPID" ]; then kill "$(cat "$FSPID")" 2>/dev/null; rm -f "$FSPID"; fi
+      setsid nohup /bin/sh -c "sleep $secs; exec '$SELF' failsafe-fire" >/dev/null 2>&1 </dev/null &
+      pid=$!
+      echo "$pid" >"$FSPID"
+      sleep 0.3
+      kill -0 "$pid" 2>/dev/null || die "the background failsafe did not stay up; no rule installed"
+      say "failsafe armed for $dur as background pid $pid (no systemd here)"
+      return 0 ;;
+    *) die "no systemd and no setsid/sleep: the rule cannot remove itself, so it is not installed" ;;
+  esac
+  cat >"$UNITDIR/$UNIT.service" <<EOF
+[Unit]
+Description=Guardrail failsafe: flush the divert chain
+[Service]
+Type=oneshot
+ExecStart=$SELF failsafe-fire
+EOF
+  cat >"$UNITDIR/$UNIT.timer" <<EOF
+[Unit]
+Description=Guardrail failsafe timer
+[Timer]
+OnActiveSec=$dur
+AccuracySec=1s
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  # stop the service too, or an elapsed cycle fires it
+  systemctl stop "$UNIT.timer" "$UNIT.service" >/dev/null 2>&1
+  systemctl reset-failed "$UNIT.service" "$UNIT.timer" >/dev/null 2>&1
+  systemctl start "$UNIT.timer" || die "the failsafe timer did not start"
+  say "failsafe armed for $dur"
+  systemctl list-timers "$UNIT.timer" --no-pager | sed -n 2p
+}
+
+failsafe_fire() {
+  local c n=0
+  for c in divert quic; do
+    [ -n "$NFT" ] && $NFT list chain inet guardrail "$c" >/dev/null 2>&1 || continue
+    if $NFT flush chain inet guardrail "$c"; then n=$((n + 1))
+    else say "failsafe: chain $c could NOT be flushed"; fi
+  done
+  if [ "$n" -gt 0 ]; then say "failsafe fired: $n chain(s) flushed (divert, quic)"
+  else say "failsafe fired: no chain to flush"; fi
+  rm -f "$FSPID"
+  [ "$HAS_SYSTEMD" = 1 ] && systemctl stop "$UNIT.timer" >/dev/null 2>&1
+  return 0
+}
+
+# Cancel whichever failsafe is armed.
+failsafe_cancel() {
+  if [ "$HAS_SYSTEMD" = 1 ]; then
+    systemctl stop "$UNIT.timer" >/dev/null 2>&1
+    systemctl reset-failed "$UNIT.service" "$UNIT.timer" >/dev/null 2>&1
+  fi
+  if [ -f "$FSPID" ]; then
+    kill "$(cat "$FSPID")" 2>/dev/null
+    rm -f "$FSPID"
+  fi
+}
+
+proxy_listeners() {
+  # v6 redirect points at ::1; a missing listener is silent
+  local v4 v6
+  v4="$(ss -ltnH "sport = :$PORT" 2>/dev/null | grep -c '127\.0\.0\.1:' || true)"
+  v6="$(ss -ltnH "sport = :$PORT" 2>/dev/null | grep -c '\[::1\]:' || true)"
+  printf '%s:%s' "${v4:-0}" "${v6:-0}"
+}
+
+listeners_warn() {
+  # warn when both IP families are not listening
+  case "$(proxy_listeners)" in
+    "1:1") return 0 ;;
+    "1:0") say "WARNING: only the IPv4 listener is up on port $PORT; the IPv6 redirect points at ::1 and will not be served" ;;
+    "0:1") say "WARNING: only the IPv6 listener is up on port $PORT; IPv4 traffic will not be served" ;;
+    *) say "WARNING: no listener on port $PORT" ;;
+  esac
+}
+
+# create the proxy user, or refuse and say why
+user_add() {
+  local nologin msg
+  nologin="$(command -v nologin || echo /bin/false)"
+  if puser_exists; then say "$PUSER already exists"
+  elif command -v useradd >/dev/null 2>&1; then
+    msg="$(useradd --system --user-group --home-dir "$STATE" --no-create-home --shell "$nologin" "$PUSER" 2>&1)" \
+      || die "proxy user $PUSER does not exist and could not be created: useradd: $msg"
+    say "$PUSER created"
+  elif command -v adduser >/dev/null 2>&1; then
+    # busybox (Alpine) has adduser only.
+    command -v addgroup >/dev/null 2>&1 && addgroup -S "$PUSER" >/dev/null 2>&1
+    msg="$(adduser -S -D -H -h "$STATE" -s "$nologin" -G "$PUSER" "$PUSER" 2>&1)" \
+      || die "proxy user $PUSER does not exist and could not be created: adduser: $msg"
+    say "$PUSER created"
+  else
+    die "proxy user $PUSER does not exist and could not be created: neither useradd nor adduser found"
+  fi
+  [ "$(id -u "$PUSER")" != 0 ] || die "$PUSER has uid 0; refusing to use it"
+  id "$PUSER"
+}
+
+need_puser() {
+  puser_exists || user_add >/dev/null
+  puser_exists || die "proxy user $PUSER does not exist and could not be created"
+  [ "$(id -u "$PUSER")" != 0 ] || die "$PUSER has uid 0; refusing to use it"
+  [ "$(id -u "$PUSER")" != "$UID_TARGET" ] || die "$PUSER shares uid $UID_TARGET with the owner; its traffic would loop"
+}
+
+# every check that must pass before mitmdump starts
+proxy_preflight() {
+  need_puser
+  if [ "$DEV" = 1 ]; then
+    need_app
+    [ -x "$MITMDUMP" ] || die "mitmdump not found: $MITMDUMP"
+    # dev keeps CA key away: proxy reads its own copy
+    if ! [ -f "$CONFDIR/mitmproxy-ca.pem" ]; then make_dirs; install_ca; fi
+    as_puser test -r "$APP/guardrail.py" && as_puser test -x "$MITMDUMP" \
+      || die "--dev: $PUSER cannot read $APP or run $MITMDUMP ($(describe "$USER_HOME")); dev mode needs that tree readable by $PUSER"
+  else
+    [ -x "$MITMDUMP" ] || die "refusing to start the proxy: $MITMDUMP is missing; run: guardrail-adm install"
+    tree_ok "$VENV" 1 || die "refusing to start the proxy: $BAD; the venv must be owned by root and writable by nobody else"
+    tree_ok "$IAPP" || die "refusing to start the proxy: $BAD; the app copy must be owned by root and writable by nobody else"
+  fi
+  puser_dir_ok "$CONFDIR" 700 || die "refusing to start the proxy: $BAD"
+  [ -f "$CONFDIR/mitmproxy-ca.pem" ] || die "refusing to start the proxy: no CA in $CONFDIR; run: guardrail-adm install"
+  puser_dir_ok "$STATE" 750 || die "refusing to start the proxy: $BAD"
+  audit_dir_ok || die "refusing to start the proxy: $BAD; reinstall with guardrail-adm install"
+  # bad weights tree is removed, never loaded
+  if [ -d "$HFDIR" ] && ! tree_ok "$HFDIR"; then
+    say "WARNING: removing $HFDIR ($BAD); model layer off until: guardrail-adm install"
+    log "model tree removed before start: $BAD"
+    rm -rf "$HFDIR"
+  fi
+  # a new audit file must come back group-readable
+  if [ "$(id -u)" -eq 0 ]; then add_audit_file; fi
+}
+
+# the one command line the proxy runs with
+build_proxy_cmd() {
+  PROXY_CMD=(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$STATE" LANG=C.UTF-8
+    GUARDRAIL_HOME="$STATE" GUARDRAIL_PAC="$PACDIR/guardrail.pac" GUARDRAIL_PAC_PROXY="127.0.0.1:$REGULAR_PORT" GUARDRAIL_CONFIG="$RUN_APP/guardrail.yaml"
+    GUARDRAIL_ATR_DIR="$RUN_APP/atr" GUARDRAIL_DLP_DIR="$RUN_APP/data/dlp"
+    HF_HOME="$HFDIR" HF_HUB_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1
+    "$MITMDUMP" --mode transparent --mode "transparent@::1:$PORT" \
+    --mode "regular@127.0.0.1:$REGULAR_PORT" \
+    --listen-host 127.0.0.1 --listen-port "$PORT" --set confdir="$CONFDIR"
+    --set http3=false --set flow_detail=1 -s "$RUN_APP/guardrail.py")
+}
+
+write_runner() {
+  build_proxy_cmd
+  install -d -o root -g root -m 0755 "$LIBDIR/bin"
+  {
+    echo '#!/bin/sh'
+    echo "# Guardrail proxy, written by guardrail-adm install. Runs as $PUSER, never as root."
+    echo '[ "$(id -u)" -ne 0 ] || { echo "guardrail proxy: refusing to run as root" >&2; exit 1; }'
+    echo 'umask 077'
+    printf 'exec >>%q 2>&1\n' "$PROXY_LOG"
+    printf 'exec'; printf ' %q' "${PROXY_CMD[@]}"; echo
+  } >"$RUNNER.tmp"
+  chmod 0755 "$RUNNER.tmp"
+  mv -f "$RUNNER.tmp" "$RUNNER"
+}
+
+unit_installed() { [ "$HAS_SYSTEMD" = 1 ] && [ -f "$UNITDIR/guardrail-proxy.service" ]; }
+
+proxy_start() {
+  local who="${1:-$PUSER}" users
+  case "$who" in
+    "$PUSER") ;;
+    root) say "note: the proxy no longer runs as root; starting it as $PUSER" ;;
+    *) die "unknown user: $who (the proxy only runs as $PUSER)" ;;
+  esac
+  if proxy_up; then
+    users="$(listener_users)"
+    say "already listening on $PORT (as: ${users:-unknown})"
+    listener_is_root "$users" && say "WARNING: a proxy running as root holds port $PORT; run proxy-stop, then proxy-start"
+    return 0
+  fi
+  proxy_preflight
+  if [ "$DEV" != 1 ] && unit_installed; then
+    chain_ok "$RUNNER" || die "refusing to start the proxy: $BAD"
+    systemctl start guardrail-proxy.service || die "guardrail-proxy.service did not start"
+  else
+    build_proxy_cmd
+    local drop=() detach=()
+    if command -v runuser >/dev/null 2>&1; then drop=(runuser -u "$PUSER" --)
+    elif command -v setpriv >/dev/null 2>&1; then
+      drop=(setpriv --reuid="$(id -u "$PUSER")" --regid="$(id -g "$PUSER")" --init-groups --)
+    else die "neither runuser nor setpriv found: cannot drop to $PUSER, so the proxy is not started"
+    fi
+    command -v setsid >/dev/null 2>&1 && detach=(setsid)
+    # proxy shell opens the log: no root write through symlink
+    "${detach[@]}" nohup "${drop[@]}" /bin/sh -c 'umask 077; exec "$@" >>"$0" 2>&1' \
+      "$PROXY_LOG" "${PROXY_CMD[@]}" >/dev/null 2>&1 </dev/null &
+  fi
+  for _ in $(seq 1 60); do proxy_up && break; sleep 0.5; done
+  proxy_up || { as_puser tail -5 "$PROXY_LOG" 2>&1; die "the proxy did not start"; }
+  pgrep -u "$PUSER" -f 'mitmdump --mode transparent' >"$PIDFILE"
+  users="$(listener_users)"
+  listener_is_root "$users" && { proxy_stop; die "the listener came up as root; stopped it"; }
+  say "proxy started as $PUSER, pid $(tr '\n' ' ' <"$PIDFILE")$([ "$DEV" = 1 ] && echo ' [dev]')"
+}
+
+set_mode() {
+  local want="${1:-}"
+  case "$want" in
+    neutral|persistent) ;;
+    *) die "unknown mode '$want': use neutral or persistent" ;;
+  esac
+  [ -d "$STATE" ] || die "no installed state at $STATE; run install first"
+  # root never writes through a symlink in $STATE
+  [ -L "$STATE/mode" ] && die "refusing to write through a symlink: $STATE/mode"
+  as_puser /bin/sh -c 'umask 022; printf "%s\n" "$1" >"$2"' sh "$want" "$STATE/mode" \
+    || die "could not write $STATE/mode as $PUSER"
+  say "mode set to $want ($STATE/mode)"
+}
+
+
+# desktop proxy preamble: prints skip reason, returns non-zero
+desktop_proxy_ready() {
+  [ -n "$OWNER" ] && [ "$UID_TARGET" != 0 ] || { say "desktop proxy step skipped: owner unknown"; return 1; }
+  desktop_tool
+  [ -n "$TOOL" ] || { say "desktop proxy step skipped: $SKIP"; return 1; }
+}
+
+# Ask a running KDE session to re-read its proxy settings.
+kde_reparse() {
+  local bus="$1"
+  [ -n "$bus" ] && command -v dbus-send >/dev/null 2>&1 || return 0
+  as_owner env "DBUS_SESSION_BUS_ADDRESS=$bus" dbus-send --type=signal /KIO/Scheduler \
+    org.kde.KIO.Scheduler.reparseSlaveConfiguration string: 2>/dev/null
+}
+
+# Remember the owner's proxy setting before changing it
+save_desktop_proxy() {
+  desktop_proxy_ready || return 0
+  local f="$VARDIR/desktop-proxy.saved" bus mode url ptype pscript
+  [ -e "$f" ] && return 0              # one save per armed stretch
+  [ -L "$f" ] && { say "saved-proxy path is a symlink; not written: $f"; return 0; }
+  bus="$(owner_bus)"
+  case "$TOOL" in
+    *gsettings)
+      [ -n "$bus" ] || { say "desktop proxy not saved: no session bus for $OWNER"; return 0; }
+      mode="$(as_owner env "DBUS_SESSION_BUS_ADDRESS=$bus" "$TOOL" get org.gnome.system.proxy mode 2>/dev/null)"
+      url="$(as_owner env "DBUS_SESSION_BUS_ADDRESS=$bus" "$TOOL" get org.gnome.system.proxy autoconfig-url 2>/dev/null)"
+      printf 'tool=gsettings\nmode=%s\nurl=%s\n' "$mode" "$url" >"$f" || return 0 ;;
+    *)
+      ptype="$(as_owner env HOME="$USER_HOME" "$TOOL" --file kioslaverc --group 'Proxy Settings' --key ProxyType 2>/dev/null)"
+      pscript="$(as_owner env HOME="$USER_HOME" "$TOOL" --file kioslaverc --group 'Proxy Settings' --key 'Proxy Config Script' 2>/dev/null)"
+      printf 'tool=kde\nmode=%s\nurl=%s\n' "$ptype" "$pscript" >"$f" || return 0 ;;
+  esac
+  chmod 0600 "$f" 2>/dev/null
+  say "owner's desktop proxy setting saved: $f"
+}
+
+# Put the owner's setting back; non-zero when none was saved
+restore_desktop_proxy() {
+  local f="$VARDIR/desktop-proxy.saved"
+  [ -f "$f" ] || return 1
+  desktop_proxy_ready || return 1
+  local tool mode url bus; bus="$(owner_bus)"
+  tool="$(sed -n 's/^tool=//p' "$f" | head -1)"
+  mode="$(sed -n 's/^mode=//p' "$f" | head -1)"
+  url="$(sed -n 's/^url=//p' "$f" | head -1)"
+  # gsettings prints its strings quoted
+  mode="${mode//\'/}"
+  url="${url//\'/}"
+  [ -n "$mode" ] || { [ "$tool" = kde ] && mode=0 || mode="none"; }
+  case "$tool" in
+    gsettings)
+      [ -n "$bus" ] || { say "desktop proxy not restored: no session bus for $OWNER"; return 1; }
+      if ! as_owner env "DBUS_SESSION_BUS_ADDRESS=$bus" "$TOOL" set org.gnome.system.proxy mode "$mode" 2>/dev/null; then
+        say "could not put the saved proxy mode back; the record is kept: $f"
+        return 1
+      fi
+      if [ -n "$url" ]; then
+        as_owner env "DBUS_SESSION_BUS_ADDRESS=$bus" "$TOOL" set org.gnome.system.proxy autoconfig-url "$url" 2>/dev/null \
+          || { say "could not put the saved script address back; the record is kept: $f"; return 1; }
+      else
+        as_owner env "DBUS_SESSION_BUS_ADDRESS=$bus" "$TOOL" reset org.gnome.system.proxy autoconfig-url 2>/dev/null
+      fi ;;
+    kde)
+      if ! as_owner env HOME="$USER_HOME" "$TOOL" --file kioslaverc --group 'Proxy Settings' --key ProxyType "$mode" 2>/dev/null; then
+        say "could not put the saved proxy mode back; the record is kept: $f"
+        return 1
+      fi
+      as_owner env HOME="$USER_HOME" "$TOOL" --file kioslaverc --group 'Proxy Settings' --key 'Proxy Config Script' "$url" 2>/dev/null
+      kde_reparse "$bus" ;;
+    *) say "saved proxy record is unreadable; left in place: $f"; return 1 ;;
+  esac
+  rm -f "$f"
+  say "owner's desktop proxy setting restored (mode $mode${url:+, script $url})"
+  return 0
+}
+
+# half-applied setting must not stay: put the saved one back
+desktop_proxy_undo() {
+  if restore_desktop_proxy; then
+    say "desktop proxy could not be set through $1; your saved setting was put back"
+  else
+    say "desktop proxy could not be set through $1; check it, it may be half-changed"
+  fi
+}
+
+# desktop_proxy from guardrail.yaml; missing reads as off
+desktop_proxy_setting() {
+  local v
+  v="$(sed -n 's/^desktop_proxy:[[:space:]]*\([A-Za-z]*\).*/\1/p' "${RUN_APP:-$APP}/guardrail.yaml" 2>/dev/null | head -1)"
+  printf '%s' "${v,,}"
+}
+
+desktop_proxy_on() {
+  # set owner's PAC here: proxy cannot reach their session
+  case "$(desktop_proxy_setting)" in
+    on|auto|yes|true) ;;
+    *) say "desktop proxy left alone: desktop_proxy is off in guardrail.yaml"; return 0 ;;
+  esac
+  desktop_proxy_ready || return 0
+  regular_up || { say "desktop proxy step skipped: nothing listens on $REGULAR_PORT"; return 0; }
+  local pac="$PACDIR/guardrail.pac"
+  [ -f "$pac" ] || { say "desktop proxy step skipped: $pac not written yet"; return 0; }
+  save_desktop_proxy
+  local bus url; bus="$(owner_bus)"; url="file://$pac"
+  case "$TOOL" in
+    *gsettings)
+      if [ -z "$bus" ]; then
+        say "desktop proxy not set: no session bus for $OWNER"
+        say "  run as $OWNER: gsettings set org.gnome.system.proxy autoconfig-url '$url'"
+        return 0
+      fi
+      if as_owner env "DBUS_SESSION_BUS_ADDRESS=$bus" "$TOOL" set org.gnome.system.proxy autoconfig-url "$url" 2>/dev/null \
+         && as_owner env "DBUS_SESSION_BUS_ADDRESS=$bus" "$TOOL" set org.gnome.system.proxy mode 'auto' 2>/dev/null; then
+        touch "$VARDIR/desktop-proxy.on"
+        say "desktop proxy points at $pac (gsettings, $OWNER)"
+      else
+        desktop_proxy_undo gsettings
+      fi ;;
+    *)
+      if as_owner env HOME="$USER_HOME" "$TOOL" --file kioslaverc --group 'Proxy Settings' --key ProxyType 2 2>/dev/null \
+         && as_owner env HOME="$USER_HOME" "$TOOL" --file kioslaverc --group 'Proxy Settings' --key 'Proxy Config Script' "$url" 2>/dev/null; then
+        touch "$VARDIR/desktop-proxy.on"
+        say "desktop proxy points at $pac ($(basename "$TOOL"), $OWNER)"
+      else
+        desktop_proxy_undo "$(basename "$TOOL")"
+      fi
+      kde_reparse "$bus" ;;
+  esac
+}
+
+
+desktop_proxy_off() {
+  # restore the owner's setting; reset only something we changed
+  if restore_desktop_proxy; then
+    rm -f "$VARDIR/desktop-proxy.on"
+    return 0
+  fi
+  if [ ! -e "$VARDIR/desktop-proxy.on" ]; then
+    say "the guardrail never changed the desktop proxy setting; leaving it as it is"
+    return 0
+  fi
+  desktop_proxy_ready || return 0
+  local bus; bus="$(owner_bus)"
+  case "$TOOL" in
+    *gsettings)
+      if [ -z "$bus" ]; then
+        say "desktop proxy not reset: no session bus for $OWNER"
+        say "  run as $OWNER: gsettings set org.gnome.system.proxy mode 'none'"
+        return 0
+      fi
+      as_owner env "DBUS_SESSION_BUS_ADDRESS=$bus" "$TOOL" set org.gnome.system.proxy mode 'none' 2>/dev/null
+      as_owner env "DBUS_SESSION_BUS_ADDRESS=$bus" "$TOOL" reset org.gnome.system.proxy autoconfig-url 2>/dev/null
+      rm -f "$VARDIR/desktop-proxy.on"
+      say "desktop proxy reset via gsettings for $OWNER" ;;
+    *)
+      as_owner env HOME="$USER_HOME" "$TOOL" --file kioslaverc --group 'Proxy Settings' --key ProxyType 0 2>/dev/null
+      as_owner env HOME="$USER_HOME" "$TOOL" --file kioslaverc --group 'Proxy Settings' --key 'Proxy Config Script' '' 2>/dev/null
+      kde_reparse "$bus"
+      rm -f "$VARDIR/desktop-proxy.on"
+      say "desktop proxy reset via $(basename "$TOOL") for $OWNER" ;;
+  esac
+}
+
+proxy_stop() {
+  local pids
+  # a standing redirect would hit a dead port
+  if [ -n "$NFT" ] && $NFT list chain inet guardrail divert 2>/dev/null | grep -q redirect; then
+    say "a redirect rule stands; lifting it before the proxy stops"
+    disarm || say "the rule could not be lifted; the failsafe stays armed"
+  fi
+  # Restart= would revive it; stop through systemd first
+  if [ "$HAS_SYSTEMD" = 1 ] && systemctl is-active --quiet guardrail-proxy.service 2>/dev/null; then
+    systemctl stop guardrail-proxy.service && say "guardrail-proxy.service stopped"
+  fi
+  # root kills only our proxy user's processes
+  pids="$(cat "$PIDFILE" 2>/dev/null; pgrep -u "$PUSER" -f 'mitmdump --mode transparent' || true)"
+  pids="$(printf '%s\n' $pids | sort -u | tr '\n' ' ')"
+  if [ -z "${pids// /}" ]; then
+    rm -f "$PIDFILE"
+    desktop_proxy_off
+    say "no proxy running"
+    return 0
+  fi
+  # kill only $PUSER's processes; never a recycled pid
+  local keep="" p
+  for p in $pids; do
+    if [ -d "/proc/$p" ] && [ "$(stat -c %U "/proc/$p" 2>/dev/null)" = "$PUSER" ]; then
+      keep="$keep $p"
+    else
+      say "not touching pid $p: it is not $PUSER's process"
+    fi
+  done
+  pids="${keep# }"
+  if [ -z "$pids" ]; then
+    rm -f "$PIDFILE"
+    desktop_proxy_off
+    say "no running process of $PUSER to stop"
+    return 0
+  fi
+  kill $pids 2>/dev/null
+  sleep 1
+  kill -9 $pids 2>/dev/null
+  rm -f "$PIDFILE"
+  desktop_proxy_off
+  say "proxy stopped: $pids"
+}
+
+status() {
+  local rp
+  need_nft
+  say "== divert chain"
+  $NFT list chain inet guardrail divert 2>&1
+  say "== quic chain"
+  $NFT list chain inet guardrail quic 2>&1
+  say "== set ai4"
+  $NFT list set inet guardrail ai4 2>&1 | sed -n '1,4p'
+  say "== set ai6"
+  $NFT list set inet guardrail ai6 2>&1 | sed -n '1,4p'
+  say "== diversion"
+  rp=0; rule_present || rp=$?
+  case "$rp" in
+    0) say "   diverting: uid $UID_TARGET tcp 443 to :$PORT, IPv4 and IPv6" ;;
+    1) say "   not diverting: no complete redirect for uid $UID_TARGET to :$PORT" ;;
+    *) say "   UNKNOWN: nft could not be read, so no claim is made either way" ;;
+  esac
+  say "== failsafe ($(failsafe_method))"
+  if [ "$HAS_SYSTEMD" = 1 ]; then
+    systemctl list-timers --all 'guardrail*' --no-pager 2>&1 | sed -n '1,3p'
+  elif [ -f "$FSPID" ] && kill -0 "$(cat "$FSPID")" 2>/dev/null; then
+    say "   background failsafe armed, pid $(cat "$FSPID")"
+  else
+    say "   no background failsafe armed"
+  fi
+  echo "== watchdog"
+  if [ -n "$OWNER" ] && [ "$UID_TARGET" != 0 ] && [ -f "$RUN_APP/watchdog.py" ]; then
+    as_owner python3 -I "$RUN_APP/watchdog.py" status 2>&1 | sed -n '1p'
+  else echo "   not checked: owner or watchdog.py missing"; fi
+  say "== proxy"
+  say "   listeners IPv4:IPv6 = $(proxy_listeners), running as: $(listener_users)"
+  listeners_warn
+  ss -ltnp "sport = :$PORT" 2>&1 | sed -n '2p'
+  say "== last records"
+  # read as the file owner: symlinks must not feed root
+  if puser_exists && [ -d "$STATE/data" ]; then
+    as_puser tail -2 "$STATE/data/history.log" 2>&1
+  elif [ -z "$APP" ] || [ -z "$OWNER" ]; then
+    say "app $APP_NOTE"
+  else
+    as_owner tail -2 "$APP/data/history.log" 2>&1
+  fi
+}
+
+failsafe_test() {
+  local secs="${1:-20}"
+  case "$secs" in ''|*[!0-9]*) die "bad seconds: $secs" ;; esac
+  [ "$secs" -ge 5 ] && [ "$secs" -le 120 ] || die "seconds must be 5 to 120: $secs"
+  proxy_up || die "REFUSED: nothing listens on port $PORT; start the proxy first: sudo $SELF proxy-start"
+  redirect_target_ok || die "failsafe-test refused: no rule was installed"
+  set_sync
+  # failsafe first: if it fails, no rule is installed
+  arm_failsafe "${secs}s"
+  add_rule
+  # same proof as arm: owner still reaches provider
+  if ! e2e_check; then
+    disarm
+    die "failsafe-test stopped: the end-to-end check failed, the rule was lifted"
+  fi
+  say "waiting $((secs + 10))s for the failsafe"
+  sleep $((secs + 10))
+  if $NFT list chain inet guardrail divert | grep -q redirect; then
+    say "FAILSAFE FAILED: the rule is still installed"
+    # The dead-man switch failed: release the rule
+    $NFT flush chain inet guardrail divert
+    $NFT flush chain inet guardrail quic 2>/dev/null
+    if $NFT list chain inet guardrail divert | grep -q redirect; then
+      say "  and it could not be flushed, so the failsafe stays armed; release it by hand: sudo $SELF disarm"
+    else
+      failsafe_cancel
+      say "  the rule was released and the failsafe cancelled; traffic is not diverted"
+    fi
+    chown_data
+    return 1
+  fi
+  say "FAILSAFE OK: the rule removed itself"
+  [ "$HAS_SYSTEMD" = 1 ] && systemctl status "$UNIT.service" --no-pager 2>&1 | sed -n '1,5p'
+  chown_data
+}
+
+# the audit file to watch, in install order
+audit_file() {
+  local f
+  for f in "$STATE/logs/audit.jsonl" "$STATE/audit.jsonl" "$APP/logs/audit.jsonl"; do
+    [ -f "$f" ] && { echo "$f"; return 0; }
+  done
+  echo "$STATE/logs/audit.jsonl"
+}
+
+
+# owner's host first (field 4), then a public fallback
+e2e_candidates() {
+  local hist="$1" host
+  if [ -f "$hist" ]; then
+    host="$(tail -50 "$hist" 2>/dev/null | awk '{print $4}' \
+            | grep -E '^[a-z0-9.-]+\.(com|id|ai|net|org)$' | sort | uniq -c | sort -rn \
+            | awk 'NR == 1 {print $2}')"
+    if [ -n "$host" ]; then
+      printf '%s\n' "https://$host/v1/chat/completions" "https://$host/v1/messages"
+    fi
+  fi
+  echo "https://api.openai.com/v1/models"
+}
+
+# one audit record in; prints ready, failed or unknown
+e2e_atr_verdict() {
+  case "$1" in
+    *atr-not-ready*|*'"atr": "error"'*) echo failed ;;
+    *'"atr": "loaded"'*) echo ready ;;
+    *) echo unknown ;;
+  esac
+}
+
+# one probe: 0 ok, 1 fail, 2 unrecorded, 3 undetermined
+e2e_probe_one() {
+  local url="$1" af="$2" probe="$3" sha="$4" bodyf="$5" before after code cexit new stat v
+  before=0; [ -f "$af" ] && before="$(wc -l <"$af" 2>/dev/null || echo 0)"
+  code="$(as_owner curl -s --noproxy '*' -o "$bodyf" -w '%{http_code}' --max-time 20 \
+          -H 'content-type: application/json' -d "$probe" "$url" 2>/dev/null)"
+  cexit=$?
+  after=0; [ -f "$af" ] && after="$(wc -l <"$af" 2>/dev/null || echo 0)"
+  case "$code" in
+    000|"") say "end-to-end check FAILED for $url: the request did not complete (code $code, curl exit $cexit)"; return 1 ;;
+  esac
+  if grep -q 'guardrail_block' "$bodyf" 2>/dev/null; then
+    say "end-to-end check FAILED for $url: our own rules refused the request (code $code)"
+    return 1
+  fi
+  if [ "$after" -gt "$before" ]; then
+    # our own record: match the probe's message hash
+    new="$(tail -n "$((after - before))" "$af" 2>/dev/null | grep -F "\"prompt_sha\": \"$sha\"")"
+    if [ -n "$new" ]; then
+      stat="$(printf '%s\n' "$new" | tail -1 | sed -n 's/.*"action": "\([A-Z]*\)".*/\1/p')"
+      v="$(e2e_atr_verdict "$(printf '%s\n' "$new" | tail -1)")"
+      if [ "$v" = failed ]; then
+        say "end-to-end check FAILED for $url: atr-not-ready, the attack rule set did not load${stat:+ ($stat)}"
+        return 1
+      fi
+      case "$stat" in
+        BLOCK|ERROR)
+          say "end-to-end check FAILED for $url: our probe was recorded as $stat, so it was refused"
+          return 1 ;;
+      esac
+      if [ "$v" = unknown ]; then
+        return 3
+      fi
+      say "end-to-end check: $url answered (code $code) and the guardrail recorded our probe${stat:+ ($stat)}"
+      return 0
+    fi
+  fi
+  say "note: $url answered (code $code) but our probe was not recorded"
+  return 2
+}
+
+e2e_check() {
+  # 1 Oct 2026: own-rule refusal is not healthy
+  command -v curl >/dev/null 2>&1 || { say "end-to-end check skipped: curl not found"; return 0; }
+  local af hist url probe text sha bodyf rc t0 waited
+  E2E_ATR_WAIT_S="${GUARDRAIL_E2E_ATR_WAIT_S:-30}"
+  case "$E2E_ATR_WAIT_S" in ''|*[!0-9]*) E2E_ATR_WAIT_S=30 ;; esac
+  # one deadline for all urls, capped at 120
+  [ "$E2E_ATR_WAIT_S" -le 120 ] || E2E_ATR_WAIT_S=120
+  af="$(audit_file)"
+  # 1 Oct audit: $STATE/history.log empty, owner host never used
+  hist="$STATE/data/history.log"
+  local -a urls=()
+  while IFS= read -r url; do urls+=("$url"); done < <(e2e_candidates "$hist")
+  text="guardrail arm check $$-$(date +%s)"
+  sha="$(printf '%s' "$text" | sha256sum | cut -c1-12)"
+  probe="{\"messages\":[{\"role\":\"user\",\"content\":\"$text\"}]}"
+  # the owner's curl must be able to write it
+  bodyf="$(as_owner mktemp "${TMPDIR:-/tmp}/guardrail-e2e-body.XXXXXX")"
+  local -a tried=()
+  t0="$(date +%s)"
+  for url in "${urls[@]}"; do
+    while :; do
+      e2e_probe_one "$url" "$af" "$probe" "$sha" "$bodyf"; rc=$?
+      if [ "$rc" = 3 ]; then
+        waited=$(( $(date +%s) - t0 ))
+        if [ "$waited" -lt "$E2E_ATR_WAIT_S" ]; then sleep 2; continue; fi
+        say "end-to-end check: rule-set state undetermined for $url after ${waited}s of waiting"
+      fi
+      break
+    done
+    if [ "$rc" = 0 ]; then
+      rm -f "$bodyf"
+      [ "${#tried[@]}" -gt 0 ] && say "end-to-end check passed on $url after failing: ${tried[*]}"
+      return 0
+    fi
+    tried+=("$url=rc$rc")
+  done
+  rm -f "$bodyf"
+  say "end-to-end check FAILED: tried ${#tried[@]} endpoints, none passed: ${tried[*]}"
+  return 1
+}
+
+
+# Owner-run watchdog: arm starts it, disarm stops it.
+watchdog_start() {
+  local wd="$RUN_APP/watchdog.py" out rc
+  local -a envv=(GUARDRAIL_PORT="$PORT" GUARDRAIL_REGULAR_PORT="$REGULAR_PORT")
+  if [ -z "$OWNER" ] || [ "$UID_TARGET" = 0 ]; then say "WATCHDOG NOT STARTED: owner unknown"; return 0; fi
+  if [ ! -f "$wd" ]; then
+    say "WATCHDOG NOT STARTED: $wd is missing; run install again so the app copy carries it"; return 0
+  fi
+  [ -n "$APP" ] && envv+=(WATCHDOG_ROUTER_PID="$APP/data/router.pid")
+  out="$(as_owner env "${envv[@]}" python3 -I "$wd" start 2>&1)"; rc=$?
+  say "watchdog: ${out:-no output}"
+  [ "$rc" = 0 ] || say "WATCHDOG IS NOT RUNNING (rc $rc): armed without it, only the failsafe covers the rule"
+  return 0
+}
+
+# A reverting watchdog ignores this and ends itself.
+watchdog_stop() {
+  local wd="$RUN_APP/watchdog.py"
+  { [ -n "$OWNER" ] && [ "$UID_TARGET" != 0 ] && [ -f "$wd" ]; } || return 0
+  say "watchdog: $(as_owner python3 -I "$wd" stop 2>&1)"
+  return 0
+}
+
+# failsafe 300..3600 s; --long lifts the top
+arm_window_ok() {
+  local secs
+  secs="$(to_seconds "${1:-15m}")" || die "bad duration: $1"
+  [ "$secs" -ge 300 ] || die "failsafe under 300s (got $1) would fire during the end-to-end check"
+  if [ "$secs" -gt 3600 ] && [ "$LONG" != 1 ]; then
+    die "failsafe over 3600s (got $1) needs --long, which asks for a password"
+  fi
+}
+
+# Refuse before any rule when the redirect target is not served.
+redirect_target_ok() {
+  local l v4 v6
+  l="$(proxy_listeners)"; v4="${l%%:*}"; v6="${l##*:}"
+  if [ "${v4:-0}" -lt 1 ]; then
+    say "REFUSED: nothing listens on 127.0.0.1:$PORT, so a redirect to it would cut your AI traffic"
+    say "  start the proxy first: sudo $SELF proxy-start (guardrail-proxy.service); no rule or desktop proxy was changed"
+    return 1
+  fi
+  if [ "${v6:-0}" -lt 1 ] && [ -e /proc/net/if_inet6 ]; then
+    say "REFUSED: no IPv6 listener on [::1]:$PORT, and the IPv6 redirect would point at it"
+    say "  restart the proxy: sudo $SELF proxy-stop, then proxy-start; no rule or desktop proxy was changed"
+    return 1
+  fi
+  return 0
+}
+
+arm() {
+  local users rp
+  arm_window_ok "${1:-15m}"
+  # arm never starts the proxy: no listener means refuse, nothing changed
+  proxy_up || die "REFUSED: nothing listens on port $PORT; start the proxy first: sudo $SELF proxy-start"
+  users="$(listener_users)"
+  case " $users " in
+    *" $PUSER "*) ;;
+    *) die "port $PORT is held by '${users:-unknown}', not $PUSER; run proxy-stop, then arm again" ;;
+  esac
+  redirect_target_ok || die "arm refused: no rule, desktop proxy or failsafe was touched"
+  # half-armed run must undo proxy setting and rules
+  ARM_OK=0
+  trap 'if [ "${ARM_OK:-0}" != 1 ]; then say "arm did not complete: taking the rule back"; disarm; fi' EXIT
+  desktop_proxy_on
+  set_sync
+  # no rule without a dead-man switch: failsafe comes first
+  arm_failsafe "${1:-15m}"
+  # listener may have gone during set-sync or failsafe setup
+  redirect_target_ok || die "arm refused: the listener went away before the rule; the exit trap undoes the rest"
+  add_rule
+  # a silent arm without the rule is worse than none
+  rp=0; rule_present || rp=$?
+  if [ "$rp" = 1 ]; then
+    say "the rule was not present after arming; installing it again"
+    add_rule
+    rp=0; rule_present || rp=$?
+  fi
+  case "$rp" in
+    0) ;;
+    2) die "arm failed: nft cannot be read, so the rule state is unknown; the exit trap takes the rule back" ;;
+    *) die "arm failed: the kernel rule is not present, so traffic would go uninspected" ;;
+  esac
+  chown_data
+  # trap stays until e2e passes
+  if ! e2e_check; then
+    say "disarming again: leaving your traffic alone is better than diverted and broken"
+    die "arm failed the end-to-end check; the exit trap takes the rule back"
+  fi
+  ARM_OK=1
+  trap - EXIT
+  # only an armed rule that passed e2e is worth watching
+  watchdog_start
+}
+
+pin_owner() {
+  install -d -o root -g root -m 0755 /etc/guardrail
+  # sync unit has no sudo: owner and app pinned root-only
+  if [ "$(conf_get OWNER_UID)" != "$UID_TARGET" ] || [ "$(conf_get APP)" != "$APP" ]; then
+    printf 'OWNER_UID=%s\nAPP=%s\n' "$UID_TARGET" "$APP" >"$CONF"
+    chmod 0644 "$CONF"
+    say "owner uid $UID_TARGET and app $APP pinned in $CONF"
+  fi
+}
+
+# phase 4/6 are units; no systemd means refused, not half-written
+units_enable() {
+  need_systemd
+  [ -d "$UNITDIR" ] || die "no $UNITDIR on this host"
+  [ -f "$UNITDIR/guardrail-proxy.service" ] || die "units not written yet; run install first"
+  systemctl enable guardrail-proxy.service guardrail-sync.timer >/dev/null 2>&1 \
+    || die "could not enable the units"
+  say "units enabled: the proxy and the sync timer start at boot"
+}
+
+
+units_install() {
+  need_systemd
+  need_nft
+  [ "$DEV" = 1 ] && die "units run the installed layout only; --dev is never made permanent"
+  proxy_preflight
+  pin_owner
+  write_runner
+  # never save an empty ruleset over a good one
+  ensure_table
+  if $NFT list table inet guardrail >"/etc/guardrail/guardrail.nft.new" 2>/dev/null \
+     && [ -s "/etc/guardrail/guardrail.nft.new" ]; then
+    mv "/etc/guardrail/guardrail.nft.new" "/etc/guardrail/guardrail.nft"
+    say "saved ruleset: /etc/guardrail/guardrail.nft ($(wc -l <"/etc/guardrail/guardrail.nft") lines)"
+  else
+    rm -f "/etc/guardrail/guardrail.nft.new"
+    say "WARNING: the nft table could not be saved, so guardrail-net.service has no ruleset"
+  fi
+  cat >"$UNITDIR/guardrail-net.service" <<EOF
+[Unit]
+Description=Guardrail network redirect (nftables)
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=$NFT -f /etc/guardrail/guardrail.nft
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat >"$UNITDIR/guardrail-proxy.service" <<EOF
+[Unit]
+Description=Guardrail transparent proxy
+After=network-online.target
+[Service]
+User=$PUSER
+Group=$(id -gn "$PUSER")
+ExecStart=$RUNNER
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=$VARDIR $LOGDIR
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat >"$UNITDIR/guardrail-sync.service" <<EOF
+[Unit]
+Description=Guardrail endpoint address sync
+[Service]
+Type=oneshot
+ExecStart=$SELF set-sync
+EOF
+  cat >"$UNITDIR/guardrail-sync.timer" <<EOF
+[Unit]
+Description=Guardrail endpoint sync timer
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+EOF
+  user_notifier_install
+  systemctl daemon-reload
+  say "units written in $UNITDIR, nothing enabled yet"
+}
+
+# the block banner runs in the user session; the proxy has no bus
+user_notifier_install() {
+  [ -f "$IAPP/notify_user.py" ] || { say "no notify_user.py in $IAPP; no user notifier unit"; return 0; }
+  install -d -o root -g root -m 0755 "$USERUNITDIR"
+  cat >"$USERUNITDIR/guardrail-notify.service" <<UNIT
+[Unit]
+Description=Guardrail block banner (reads the audit file, raises desktop notes)
+ConditionPathExists=$LOGDIR/audit.jsonl
+
+[Service]
+ExecStart=/usr/bin/python3 -I $IAPP/notify_user.py $LOGDIR/audit.jsonl
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+  chmod 0644 "$USERUNITDIR/guardrail-notify.service"
+  say "user unit written: $USERUNITDIR/guardrail-notify.service (not enabled)"
+  say "  the owner starts it in the desktop session with: systemctl --user enable --now guardrail-notify.service"
+}
+
+units_remove() {
+  if [ "$HAS_SYSTEMD" != 1 ]; then say "no systemd here: no units to remove"; return 0; fi
+  systemctl disable --now guardrail-net.service guardrail-proxy.service guardrail-sync.timer >/dev/null 2>&1
+  rm -f "$UNITDIR/guardrail-net.service" "$UNITDIR/guardrail-proxy.service" \
+        "$UNITDIR/guardrail-sync.service" "$UNITDIR/guardrail-sync.timer" \
+        /etc/guardrail/guardrail.nft
+  rm -f "$USERUNITDIR/guardrail-notify.service"
+  systemctl daemon-reload
+  say "units removed, /etc/guardrail left in place"
+}
+
+show_journal() {
+  local u="${1:-}"
+  case "$u" in guardrail*) ;; *) die "only guardrail units: $u" ;; esac
+  command -v journalctl >/dev/null 2>&1 || die "no journalctl here; the helper's own record is $LOG"
+  journalctl -u "$u" -n 40 --no-pager 2>&1
+}
+
+seal_logs() {
+  local f
+  for f in /tmp/guardrail-run.log /tmp/guardrail-router.log /tmp/guardrail-watch.md; do
+    if [ -L "$f" ]; then say "not sealed, a symlink: $f"
+    elif [ -f "$f" ]; then chmod 0600 "$f"; say "sealed $f"; fi
+  done
+}
+
+purge_logs() {
+  local f
+  for f in /tmp/guardrail-*.log; do
+    if [ -f "$f" ]; then rm -f "$f"; say "removed $f"; fi
+  done
+}
+
+revoke() {
+  # the failsafe unit runs this helper: release the rule first
+  if [ -n "$NFT" ] && $NFT list table inet guardrail 2>/dev/null | grep -qE 'redirect to|udp dport 443'; then
+    say "the redirect rule is still installed; releasing it before the helper goes away"
+    disarm
+  fi
+  # the failsafe runs this helper: removing it strands the rule
+  if [ -n "$NFT" ] && $NFT list table inet guardrail 2>/dev/null | grep -qE 'redirect to|udp dport 443'; then
+    say "REFUSING to remove the helper: the redirect rule is still installed"
+    say "  the failsafe runs $SELF, so removing it strands the rule with no way back"
+    say "  release it first: sudo $SELF disarm"
+    return 1
+  fi
+  # an enabled net unit diverts again at boot
+  if [ "$HAS_SYSTEMD" = 1 ] && systemctl is-enabled --quiet guardrail-net.service 2>/dev/null; then
+    say "REFUSING to remove the helper: guardrail-net.service is still enabled"
+    say "  at the next boot it would load the saved ruleset, with no helper to undo it"
+    say "  disable it first: sudo $SELF disarm"
+    return 1
+  fi
+  rm -f "$SUDOERS_FILE" /etc/sudoers.d/guardrail-test && say "sudoers entry removed"
+  rm -f "$HELPER_PATH" "$OLD_HELPER_PATH" && say "helper removed from /usr/local/sbin"
+  say "root access released; confirm with: sudo -n -l"
+}
+
+disarm() {
+  local rc=0
+  # an enabled net unit would divert again at boot
+  if [ "$HAS_SYSTEMD" = 1 ] && systemctl is-enabled --quiet guardrail-net.service 2>/dev/null; then
+    if systemctl disable --now guardrail-net.service >/dev/null 2>&1; then
+      say "guardrail-net.service disabled: it cannot divert again at boot"
+    else
+      say "guardrail-net.service is enabled and could not be disabled; it will divert again at boot"
+    fi
+  fi
+  if [ -n "$NFT" ] && $NFT list chain inet guardrail divert >/dev/null 2>&1; then
+    if $NFT flush chain inet guardrail divert; then say "divert chain flushed"
+    else say "divert chain could NOT be flushed"; rc=1; fi
+  else
+    say "no divert chain to flush"
+  fi
+  # the quic rejects go too: revoke refuses while they stand
+  if [ -n "$NFT" ] && $NFT list chain inet guardrail quic >/dev/null 2>&1; then
+    if $NFT flush chain inet guardrail quic; then say "quic chain flushed"
+    else say "quic chain could NOT be flushed"; rc=1; fi
+  fi
+  # cancel the failsafe only once the rules are gone
+  if [ "$rc" = 0 ]; then failsafe_cancel; watchdog_stop
+  else say "the rule may still stand, so the failsafe stays armed"; fi
+  # reset desktop PAC: stale one broke browsers, 1 Oct 2026
+  desktop_proxy_off
+  if proxy_up; then say "proxy still listening on $PORT"; else say "proxy is not listening"; fi
+  chown_data
+  return "$rc"
+}
+
+# ---- install / verify / uninstall ---------------------------------------------------------------
+
+# sha256 of the first PEM cert on stdin, colon separated
+cert_fp() {
+  python3 -I -c '
+import hashlib, re, ssl, sys
+m = re.search(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", sys.stdin.read(), re.S)
+if m:
+    h = hashlib.sha256(ssl.PEM_cert_to_DER_cert(m.group(0))).hexdigest().upper()
+    print(":".join(h[i:i + 2] for i in range(0, len(h), 2)))'
+}
+
+record_add() { printf '%s=%s\n' "$1" "$2" >>"$RECORD.new"; }
+rec_get() { { root_file_get "$RECORD" "$1"; root_file_get "$RECORD.new" "$1"; } | awk '!seen[$0]++'; }
+
+# load the plan from rules.py after the copy passes checks
+load_plan() {
+  tree_ok "$IAPP" || die "refusing to run rules.py as root: $BAD"
+  local out
+  out="$(SUDO_UID="$UID_TARGET" python3 -I "$IAPP/rules.py" plan)" || die "rules.py plan failed"
+  eval "$out"
+  say "host: $GR_DISTRO_NAME (id $GR_DISTRO_ID${GR_DISTRO_LIKE:+, like $GR_DISTRO_LIKE}), pid 1 $GR_INIT"
+}
+
+# restrict the owner's CA key copy to them only
+tighten_owner_ca() {
+  # owner's CA private key stays, readable only by them
+  local dir="$USER_HOME/.mitmproxy"
+  [ -d "$dir" ] || return 0
+  # no symlink: it could aim root at the wrong dir
+  [ -L "$dir" ] && { say "owner-side CA directory is a symlink; left alone: $dir"; return 0; }
+  # files are the owner's, so the owner tightens them
+  as_owner chmod 0700 "$dir" 2>/dev/null
+  for f in mitmproxy-ca.pem mitmproxy-ca.p12; do
+    [ -f "$dir/$f" ] && as_owner chmod 0600 "$dir/$f" 2>/dev/null
+  done
+  say "owner-side CA key directory restricted: $dir (0700), key file 0600"
+}
+
+# per-family packages; --no-deps skips installing them
+install_deps() {
+  local family dry="${1:-0}"
+  family="$(host_family)"
+  if [ -z "$family" ]; then
+    say "distro family not recognised; install these yourself: $(requirements_lines | awk -F'|' '{gsub(/[[:space:]]/,"",$1); printf "%s ", $1}')"
+    return 0
+  fi
+  # --dry-run only reports: a plan installs nothing
+  if [ "$dry" = 1 ]; then
+    requirements_report || say "  a real install would install the missing ones first"
+    return 0
+  fi
+  if requirements_report; then
+    return 0
+  fi
+  if [ "$NO_DEPS" = 1 ]; then
+    say "not installing (--no-deps): install the missing ones yourself and retry"
+    return 0
+  fi
+  requirements_install || return 1
+  # installed but still absent: say so, do not continue
+  if ! requirements_report; then
+    say "prerequisites are still missing after installing; fix them, then run install again"
+    return 1
+  fi
+  if ldd --version 2>&1 | head -1 | grep -qi musl; then
+    say "note: this system uses musl, while the mitmproxy packages are built for glibc;"
+    say "      pip may have to build from source, which is slow and can fail"
+  fi
+}
+
+copy_app() {
+  local stage f have=() before after
+  before="$(app_digest)"
+  for f in $APP_FILES; do as_owner test -e "$APP/$f" && have+=("$f"); done
+  [ -f "$APP/guardrail.py" ] && printf '%s\n' "${have[@]}" | grep -qx guardrail.py || die "no guardrail.py in $APP"
+  install -d -o root -g root -m 0755 "$LIBDIR"
+  stage="$(mktemp -d "$LIBDIR/.app.XXXXXX")" || die "mktemp failed"
+  # only the copied entries; .venv is never copied
+  ensure_no_outside_links "$APP" "${have[@]}" || { rm -rf "$stage"; die "$BAD"; }
+  # pipefail: a failed owner read is not an empty copy
+  if ! (set -o pipefail; as_owner tar -C "$APP" -chf - --exclude=__pycache__ "${have[@]}" \
+       | tar -C "$stage" --no-same-owner --no-same-permissions -xf -); then
+    rm -rf "$stage"; die "copying $APP failed"
+  fi
+  for f in "${have[@]}"; do
+    [ -e "$stage/$f" ] || { rm -rf "$stage"; die "copy lost $f; installed app left as it was"; }
+  done
+  cmp -s "$APP/guardrail.py" "$stage/guardrail.py" \
+    || { rm -rf "$stage"; die "copied guardrail.py differs from $APP/guardrail.py"; }
+  chown -hR root:root "$stage"
+  chmod -R u=rwX,go=rX "$stage"
+  chmod 0755 "$stage"
+  # a live listener never serves files being replaced
+  if [ "$(app_digest "$stage")" != "$before" ] && proxy_up; then
+    say "app changed: the proxy is DOWN from now until it is started again; with an armed rule your AI access is cut meanwhile"
+    say "  if install stops early, recover with: sudo $SELF proxy-start"
+    proxy_stop
+  fi
+  rm -rf "$IAPP.old"
+  [ -d "$IAPP" ] && mv "$IAPP" "$IAPP.old"
+  mv "$stage" "$IAPP"
+  if ! tree_ok "$IAPP"; then
+    rm -rf "$IAPP"; [ -d "$IAPP.old" ] && mv "$IAPP.old" "$IAPP"
+    die "the app copy failed its own check: $BAD; the previous app is back; recover with: sudo $SELF proxy-start"
+  fi
+  after="$(app_digest)"
+  [ "$before" = "$after" ] && APP_CHANGED=0 || APP_CHANGED=1
+  # rollback returns to this copy
+  if [ "$APP_CHANGED" = 1 ] && [ -d "$IAPP.old" ]; then
+    rm -rf "$IAPP.prev"; mv "$IAPP.old" "$IAPP.prev"
+  fi
+  rm -rf "$IAPP.old"
+  say "app copied to $IAPP (${have[*]})$([ "$APP_CHANGED" = 1 ] && echo ', changed' || echo ', unchanged')"
+}
+
+app_digest() { local d="${1:-$IAPP}"; [ -d "$d" ] && (cd "$d" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum) 2>/dev/null; }
+
+# all pins present in $VENV; only after tree_ok passed
+venv_has() {
+  [ -x "$VENV/bin/python" ] && [ -x "$VENV/bin/mitmdump" ] || return 1
+  "$VENV/bin/python" -I - "$@" <<'PY'
+import importlib.metadata as m, sys
+for pin in sys.argv[1:]:
+    name, _, ver = pin.partition("==")
+    try:
+        have = m.version(name)
+    except m.PackageNotFoundError:
+        sys.exit(1)                       # a missing package is missing, version or not
+    if ver and have != ver:
+        sys.exit(1)
+PY
+}
+
+# root venv mirrors the project pins, wheels only
+build_venv() {
+  local with_model="$1" py out pins=() p keep_old
+  out="$(as_owner python3 -I "$IAPP/rules.py" venv-pins "$APP" ${with_model:+--with-model})" \
+    || die "cannot read the package versions of $APP/.venv"
+  GR_PINS=(); GR_PIN_MISSING=(); GR_PIN_PYTHON=""
+  eval "$out"
+  for p in "${GR_PINS[@]}"; do
+    [[ "$p" =~ ^[A-Za-z0-9._-]+(==[A-Za-z0-9.+!_-]+)?$ ]] || die "odd package pin from the project venv: $p"
+    pins+=("$p")
+  done
+  printf '%s\n' "${pins[@]}" | grep -q '^mitmproxy\(==\|$\)' || die "no mitmproxy in $APP/.venv; cannot tell which version to install"
+  [ "${#GR_PIN_MISSING[@]}" -eq 0 ] || say "note: not in the project venv, so not installed: ${GR_PIN_MISSING[*]}"
+  # same python minor as the project venv, if present
+  if [ -n "$GR_PIN_PYTHON" ]; then py="$(command -v "python${GR_PIN_PYTHON%.*}" || command -v python3)"
+  else py="$(command -v python3)"; fi
+  # existing venv runs as root only after tree_ok passes
+  keep_old=1
+  # arg 1: venv python links out; bare check always failed
+  if [ -d "$VENV" ] && ! tree_ok "$VENV" 1; then
+    say "existing $VENV fails the check ($BAD); it is rebuilt, not reused"
+    keep_old=0
+  elif [ -d "$VENV" ] && venv_has "${pins[@]}"; then
+    say "venv $VENV already has ${pins[*]}"; VENV_CHANGED=0; return 0
+  fi
+  say "building $VENV with $py: ${pins[*]}"
+  rm -rf "$VENV.old"
+  if [ -d "$VENV" ]; then
+    if [ "$keep_old" = 1 ]; then mv "$VENV" "$VENV.old"; else rm -rf "$VENV"; fi
+  fi
+  # built in place: venv hardcodes its own path
+  if ! "$py" -I -m venv "$VENV"; then
+    rm -rf "$VENV"; [ -d "$VENV.old" ] && mv "$VENV.old" "$VENV"
+    die "$py -m venv failed (is the venv module of $py installed?); nothing was switched"
+  fi
+  # no config, no cache, no sdist: nothing untrusted as root
+  if ! env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root PIP_CONFIG_FILE=/dev/null \
+       "$VENV/bin/python" -I -m pip install --isolated --no-cache-dir --disable-pip-version-check \
+       --no-input --only-binary=:all: "${pins[@]}"; then
+    rm -rf "$VENV"; [ -d "$VENV.old" ] && mv "$VENV.old" "$VENV"
+    die "pip could not install ${pins[*]} (no network, or no wheel for this platform).
+  Nothing was switched: $([ -d "$VENV" ] && echo "the previous $VENV is back in place" || echo "no venv is installed").
+  The project venv is never used instead. Retry when online, or undo with: guardrail-adm uninstall"
+  fi
+  rm -rf "$VENV.old"
+  chown -hR root:root "$VENV"
+  chmod -R go-w "$VENV"
+  tree_ok "$VENV" 1 || die "the venv failed its own check: $BAD"
+  VENV_CHANGED=1
+  say "venv ready: $("$VENV/bin/python" -I -c 'import importlib.metadata as m; print("mitmproxy", m.version("mitmproxy"))')"
+}
+
+# pinned model files: repo, commit, file, algorithm, digest
+model_manifest() {
+  cat <<'EOF'
+urchade/gliner_multi_pii-v1 1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d pytorch_model.bin sha256 3003753fba99e40645cf088c7367a2c6211fc174897dc64f1f9c147c29d18d2d
+urchade/gliner_multi_pii-v1 1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d gliner_config.json sha256 2088bee85f50849dea2ab4cf411ab5cf3aaaf7c8a45c23412035978b2bc02801
+microsoft/mdeberta-v3-base a0484667b22365f84929a935b5e50a51f71f159d spm.model sha256 13c8d666d62a7bc4ac8f040aab68e942c861f93303156cc28f5c7e885d86d6e3
+microsoft/mdeberta-v3-base a0484667b22365f84929a935b5e50a51f71f159d tokenizer_config.json sha256 3f3978e0c036f2c2588cac34a6047cbb0af0b0dc1814254e291028529805496d
+microsoft/mdeberta-v3-base a0484667b22365f84929a935b5e50a51f71f159d config.json gitsha1 27b905d788d20826414d27ce9fa9765623e38ea7
+EOF
+}
+
+# gitsha1 is the hub blob name, where no sha256 pinned
+file_digest() {
+  case "$1" in
+    sha256) sha256sum -- "$2" | cut -d' ' -f1 ;;
+    gitsha1) { printf 'blob %s\0' "$(wc -c <"$2")"; cat -- "$2"; } | sha1sum | cut -d' ' -f1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# all pinned files present and matching; BAD names first failure
+model_check() {
+  local root="$1" repo commit file alg want f got
+  while read -r repo commit file alg want; do
+    f="$root/hub/models--${repo//\//--}/snapshots/$commit/$file"
+    [ -f "$f" ] && [ ! -L "$f" ] || { BAD="model file missing: $f"; return 1; }
+    got="$(file_digest "$alg" "$f")"
+    [ "$got" = "$want" ] || { BAD="$f fails its pin ($alg expected $want, got ${got:-none})"; return 1; }
+  done < <(model_manifest)
+}
+
+# stage owner's cache as root; one bad pin installs nothing
+install_model() {
+  local src="$1" stage="$LIBDIR/hf.new" repo commit file alg want d dest
+  if [ -z "$src" ]; then say "model: no owner cache path known; model layer not installed"; return 1; fi
+  rm -rf "$stage"
+  install -d -m 0755 "$stage/hub" || return 1
+  while read -r repo commit file alg want; do
+    d="models--${repo//\//--}"
+    dest="$stage/hub/$d/snapshots/$commit/$file"
+    install -d -m 0755 "${dest%/*}" "$stage/hub/$d/refs"
+    printf '%s' "$commit" >"$stage/hub/$d/refs/main"
+    # root never opens the owner's path; the owner's cat does
+    if ! as_owner cat -- "$src/$d/snapshots/$commit/$file" >"$dest" 2>/dev/null </dev/null; then
+      rm -rf "$stage"; say "model: $d/snapshots/$commit/$file not readable in $src; model layer not installed"
+      return 1
+    fi
+  done < <(model_manifest)
+  chown -hR root:root "$stage"
+  chmod -R a+rX,go-w "$stage"
+  if ! model_check "$stage"; then
+    rm -rf "$stage"; say "model: CHECKSUM FAILURE, nothing installed: $BAD"
+    return 1
+  fi
+  tree_ok "$stage" || { rm -rf "$stage"; say "model: staged tree refused: $BAD"; return 1; }
+  rm -rf "$HFDIR.old"
+  [ -d "$HFDIR" ] && mv "$HFDIR" "$HFDIR.old"
+  mv "$stage" "$HFDIR" && rm -rf "$HFDIR.old"
+  say "model layer installed in $HFDIR ($(du -sh "$HFDIR" | cut -f1)), every file matches its pin"
+}
+
+make_dirs() {
+  local d
+  [ -n "$OWNER_GROUP" ] || die "owner group unknown; cannot set the audit directory group"
+  for d in "$VARDIR" "$CONFDIR" "$STATE" "$STATE/data" "$LOGDIR"; do
+    [ -L "$d" ] && die "$d is a symlink; refused"
+  done
+  install -d -o root -g root -m 0755 "$VARDIR"
+  install -d -o "$PUSER" -g "$(id -gn "$PUSER")" -m 0700 "$CONFDIR"
+  install -d -o "$PUSER" -g "$(id -gn "$PUSER")" -m 0750 "$STATE"
+  # audit dir: proxy owns it, the owner's group reads it
+  install -d -o "$PUSER" -g "$OWNER_GROUP" -m 2750 "$LOGDIR"
+  # PAC is read by the owner's session, so 0755
+  install -d -o "$PUSER" -g "$(id -gn "$PUSER")" -m 0755 "$PACDIR"
+  as_puser mkdir -p "$STATE/data"
+  # notify writes <GUARDRAIL_HOME>/logs, which lands in $LOGDIR
+  if [ ! -e "$STATE/logs" ] || [ -L "$STATE/logs" ]; then as_puser ln -sfn "$LOGDIR" "$STATE/logs"; fi
+  add_audit_file
+}
+
+# create the audit file so appends keep its mode
+add_audit_file() {
+  local f="$LOGDIR/audit.jsonl"
+  [ -L "$f" ] && { say "audit file is a symlink; left alone: $f"; return 0; }
+  if [ ! -e "$f" ]; then
+    as_puser /bin/sh -c 'umask 027; : >"$0"' "$f" || { say "could not create $f"; return 0; }
+  fi
+  chown "$PUSER:$OWNER_GROUP" "$f" 2>/dev/null
+  chmod 0640 "$f" 2>/dev/null
+  say "audit file: $(describe "$f")"
+}
+
+LOGROTATE_FILE=/etc/logrotate.d/guardrail
+
+# audit: rename+create, nothing lost, never deleted
+logrotate_text() {
+  cat <<EOF
+# Written by guardrail-adm install. Removed by uninstall.
+# audit.jsonl: the proxy reopens it per write, so rename is lossless.
+# rotate 1200 keeps every file for years; compressed it is tiny.
+$LOGDIR/audit.jsonl {
+    su $PUSER $OWNER_GROUP
+    monthly
+    maxsize 50M
+    rotate 1200
+    dateext
+    dateformat -%Y%m%d-%s
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 $PUSER $OWNER_GROUP
+    postrotate
+        chmod 0640 $LOGDIR/audit.jsonl 2>/dev/null || true
+    endscript
+}
+
+# detector-metrics.jsonl: reopened per write too, rename is safe.
+$LOGDIR/detector-metrics.jsonl {
+    su $PUSER $OWNER_GROUP
+    weekly
+    maxsize 10M
+    rotate 12
+    dateext
+    dateformat -%Y%m%d-%s
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0600 $PUSER $PUSER
+}
+
+# proxy.log: the shell holds it open, so copy then truncate.
+# Lines written inside that window are lost; audit.jsonl holds decisions.
+$LOGDIR/proxy.log {
+    su $PUSER $OWNER_GROUP
+    daily
+    maxsize 20M
+    rotate 14
+    dateext
+    dateformat -%Y%m%d-%s
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+}
+EOF
+}
+
+logrotate_install() {
+  [ "$DEV" = 1 ] && return 0
+  [ -d /etc/logrotate.d ] || { say "no /etc/logrotate.d; log rotation not installed"; return 0; }
+  local tmp
+  tmp="$(mktemp)" || return 0
+  logrotate_text >"$tmp"
+  install -o root -g root -m 0644 "$tmp" "$LOGROTATE_FILE" \
+    && say "log rotation: $LOGROTATE_FILE (audit kept, proxy.log capped)"
+  rm -f "$tmp"
+}
+
+# no CA anywhere: ask mitmdump to make one
+create_ca() {
+  local dur=0 pid
+  say "no CA yet: asking mitmdump to create one in $CONFDIR"
+  as_puser env HOME="$STATE" "$VENV/bin/mitmdump" --set confdir="$CONFDIR" \
+    --mode regular --listen-port 8895 -q >/dev/null 2>&1 &
+  pid=$!
+  while [ "$dur" -lt 40 ]; do
+    as_puser test -s "$CONFDIR/mitmproxy-ca.pem" && break
+    sleep 0.5; dur=$((dur + 1))
+  done
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  # runuser forks mitmdump: kill the real 8895 process
+  pkill -u "$PUSER" -f 'mitmdump.*--listen-port 8895' 2>/dev/null || true
+}
+
+# copy CA files to $CONFDIR, written by the proxy user
+copy_ca_files() {
+  local tmp="$1" f
+  for f in $CA_FILES; do
+    [ "$f" = mitmproxy-ca.pem ] || as_owner cat "$USER_HOME/.mitmproxy/$f" >"$tmp/$f" 2>/dev/null || { rm -f "$tmp/$f"; continue; }
+    # proxy user writes it; root never opens that path
+    as_puser /bin/sh -c 'umask 077; cat >"$0"' "$CONFDIR/$f" <"$tmp/$f" || { rm -rf "$tmp"; die "writing $CONFDIR/$f failed"; }
+  done
+}
+
+# publish cert and prove key, cert, source share one identity
+publish_ca() {
+  local src_fp="$1" tmp cert_fp_pub
+  tmp="$(mktemp)"
+  as_puser cat "$CONFDIR/mitmproxy-ca-cert.pem" >"$tmp" 2>/dev/null || as_puser cat "$CONFDIR/mitmproxy-ca.pem" \
+    | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' >"$tmp"
+  cert_fp_pub="$(cert_fp <"$tmp")"
+  CA_FP="$(as_puser cat "$CONFDIR/mitmproxy-ca.pem" | cert_fp)"
+  [ -n "$CA_FP" ] && [ "$cert_fp_pub" = "$CA_FP" ] || { rm -f "$tmp"; die "the CA certificate ($cert_fp_pub) does not match the CA key file ($CA_FP)"; }
+  [ -z "$src_fp" ] || [ "$src_fp" = "$CA_FP" ] || { rm -f "$tmp"; die "fingerprint changed during copy: $src_fp -> $CA_FP"; }
+  install -d -o root -g root -m 0755 "$LIBDIR"
+  install -o root -g root -m 0644 "$tmp" "$CA_PUB"
+  rm -f "$tmp"
+  say "CA fingerprint sha256 $CA_FP (source ${src_fp:-not present}, $CONFDIR, $CA_PUB: same)"
+}
+
+# copy the owner's CA to $CONFDIR, or create one
+install_ca() {
+  local tmp src_fp dst_fp
+  tmp="$(mktemp -d)" || die "mktemp failed"
+  if as_owner cat "$USER_HOME/.mitmproxy/mitmproxy-ca.pem" >"$tmp/mitmproxy-ca.pem" 2>/dev/null; then
+    src_fp="$(cert_fp <"$tmp/mitmproxy-ca.pem")"
+  else
+    src_fp=""
+  fi
+  dst_fp="$(as_puser cat "$CONFDIR/mitmproxy-ca.pem" 2>/dev/null | cert_fp)"
+  if [ -z "$src_fp" ] && [ -z "$dst_fp" ]; then
+    # no CA anywhere: let mitmdump create one, do not fail
+    create_ca
+    dst_fp="$(as_puser cat "$CONFDIR/mitmproxy-ca.pem" 2>/dev/null | cert_fp)"
+    if [ -z "$dst_fp" ]; then
+      rm -rf "$tmp"
+      die "mitmdump did not create a CA in $CONFDIR within 20s; nothing installed"
+    fi
+    say "CA created by mitmdump in $CONFDIR"
+  fi
+  if [ -n "$dst_fp" ] && [ -n "$src_fp" ] && [ "$dst_fp" != "$src_fp" ]; then
+    rm -rf "$tmp"
+    die "$CONFDIR holds a different CA ($dst_fp) than $USER_HOME/.mitmproxy ($src_fp); a CA identity is not replaced. Run uninstall first if that is intended"
+  fi
+  if [ -n "$src_fp" ] && [ -z "$dst_fp" ]; then
+    copy_ca_files "$tmp"
+    say "CA copied from $USER_HOME/.mitmproxy to $CONFDIR"
+  else
+    say "CA already in $CONFDIR"
+  fi
+  rm -rf "$tmp"
+  # The public certificate, for trust stores and NODE_EXTRA_CA_CERTS.
+  publish_ca "$src_fp"
+  # owner keeps their CA key; restrict it here, once
+  tighten_owner_ca
+}
+
+install_trust() {
+  local entry u d marker
+  case "$GR_CA_METHOD" in
+    anchor-dir)
+      if cmp -s "$CA_PUB" "$GR_CA_ANCHOR"; then say "trust anchor $GR_CA_ANCHOR already current"
+      else
+        install -o root -g root -m 0644 "$CA_PUB" "$GR_CA_ANCHOR"
+        "${GR_CA_UPDATE[@]}" >/dev/null 2>&1 && say "trust anchor $GR_CA_ANCHOR installed, ${GR_CA_UPDATE[*]} ran" \
+          || say "WARNING: ${GR_CA_UPDATE[*]} failed; anchor written at $GR_CA_ANCHOR"
+      fi
+      record_add ANCHOR "$GR_CA_ANCHOR"
+      record_add UPDATE "${GR_CA_UPDATE[*]}" ;;
+    p11-kit)
+      "$GR_CA_P11KIT" anchor --store "$CA_PUB" >/dev/null 2>&1 && say "trust anchor stored with p11-kit" \
+        || say "WARNING: p11-kit trust anchor --store failed"
+      record_add P11KIT "$GR_CA_P11KIT" ;;
+    *) say "skipped system trust: ${GR_CA_SKIP:-unknown CA store}" ;;
+  esac
+  if [ -n "$GR_CA_BUNDLE" ]; then
+    marker="$(sed -n 2p "$CA_PUB")"
+    grep -qF "$marker" "$GR_CA_BUNDLE" && say "system bundle $GR_CA_BUNDLE carries the CA" \
+      || say "WARNING: system bundle $GR_CA_BUNDLE does not carry the CA yet"
+  fi
+  # each NSS store written by the account that owns it
+  if [ -z "$GR_CERTUTIL" ]; then
+    say "skipped NSS stores: certutil not found (${#GR_NSS_DBS[@]} store(s) seen)"
+  else
+    for entry in "${GR_NSS_DBS[@]}"; do
+      u="${entry%%:*}"; d="${entry#*:}"
+      if as_user "$u" "$GR_CERTUTIL" -d "sql:$d" -A -n guardrail -t "C,," -i "$CA_PUB" 2>/dev/null; then
+        say "NSS: guardrail CA in $d ($u)"; record_add NSS "$entry"
+      else
+        say "WARNING: NSS store $d ($u) not updated"
+      fi
+    done
+    [ "${#GR_NSS_DBS[@]}" -gt 0 ] || say "no NSS stores found"
+  fi
+  # runtimes ignoring the system store read these at login
+  case "$GR_ENV_METHOD" in
+    environment.d)
+      install -d -o root -g root -m 0755 "$(dirname "$GR_ENV_FILE")"
+      {
+        echo "# Guardrail CA, written by guardrail-adm install."
+        [ -n "$GR_CA_BUNDLE" ] && printf 'SSL_CERT_FILE=%s\nREQUESTS_CA_BUNDLE=%s\nCURL_CA_BUNDLE=%s\n' "$GR_CA_BUNDLE" "$GR_CA_BUNDLE" "$GR_CA_BUNDLE"
+        printf 'NODE_EXTRA_CA_CERTS=%s\n' "$CA_PUB"
+      } >"$GR_ENV_FILE"
+      chmod 0644 "$GR_ENV_FILE"; record_add ENVFILE "$GR_ENV_FILE"
+      say "CA variables in $GR_ENV_FILE (read at the next login)" ;;
+    profile.d)
+      {
+        echo "# Guardrail CA, written by guardrail-adm install."
+        [ -n "$GR_CA_BUNDLE" ] && printf 'export SSL_CERT_FILE=%q REQUESTS_CA_BUNDLE=%q CURL_CA_BUNDLE=%q\n' "$GR_CA_BUNDLE" "$GR_CA_BUNDLE" "$GR_CA_BUNDLE"
+        printf 'export NODE_EXTRA_CA_CERTS=%q\n' "$CA_PUB"
+      } >"$GR_ENV_FILE"
+      chmod 0644 "$GR_ENV_FILE"; record_add ENVFILE "$GR_ENV_FILE"
+      say "CA variables in $GR_ENV_FILE (read by login shells)" ;;
+    *) say "skipped CA variables: ${GR_ENV_SKIP:-no place for them}" ;;
+  esac
+}
+
+dry_run_report() {
+  # prints this device's plan from the install values; changes nothing
+  local plan with_model="$1" persist="$2" enable_units="$3" dur="$4" evaluated=0
+  # the owner's copy is never evaluated as root
+  GR_DISTRO_NAME="" GR_DISTRO_ID="" GR_DISTRO_LIKE="" GR_INIT=""
+  GR_CA_METHOD="" GR_CA_ANCHOR="" GR_CA_BUNDLE="" GR_ENV_FILE="" GR_ENV_METHOD=""
+  GR_NSS_DBS=()
+  say "== install plan for this machine (nothing is changed) =="
+  # Only a root-owned copy is evaluated as root
+  if [ "$(id -u)" != 0 ]; then
+    plan="$(python3 -I "$APP/rules.py" plan 2>/dev/null)"
+    [ -n "$plan" ] && eval "$plan" && evaluated=1
+  elif [ -f "$IAPP/rules.py" ] && tree_ok "$IAPP"; then
+    plan="$(SUDO_UID="$UID_TARGET" python3 -I "$IAPP/rules.py" plan 2>/dev/null)"
+    [ -n "$plan" ] && eval "$plan" && evaluated=1
+  else
+    # The project tree is the owner's: lines shown, never evaluated
+    plan="$(as_owner python3 -I "$APP/rules.py" plan 2>/dev/null)"
+    if [ -n "$plan" ]; then
+      say "plan from the project copy (shown, not evaluated as root):"
+      printf '%s\n' "$plan" | sed 's/^/  /'
+    fi
+  fi
+  if [ "$evaluated" = 1 ]; then
+    say "host       : $GR_DISTRO_NAME (id $GR_DISTRO_ID${GR_DISTRO_LIKE:+, like $GR_DISTRO_LIKE}), init $GR_INIT"
+    say "CA         : method ${GR_CA_METHOD:-unclear}${GR_CA_ANCHOR:+, anchor $GR_CA_ANCHOR}"
+    say "CA bundle  : ${GR_CA_BUNDLE:-not found}"
+    say "NSS        : ${#GR_NSS_DBS[@]} browser store(s) found"
+    say "CA vars    : ${GR_ENV_FILE:-no place}${GR_ENV_METHOD:+ (via $GR_ENV_METHOD)}"
+  elif [ -n "$plan" ]; then
+    say "host       : not evaluated (the copy in the project tree belongs to you)"
+  else
+    say "host       : rules.py plan could not run; the rest of the plan is still shown"
+  fi
+  say "account    : owner $OWNER (uid $UID_TARGET), proxy user $PUSER"
+  say "root venv  : $VENV (built from the project venv pins; needs network once)"
+  say "app        : root-owned copy at $IAPP"
+  say "state dirs : $CONFDIR, $STATE, $PACDIR (owned by $PUSER, proxy-only)"
+  say "audit dir  : $LOGDIR (owner $PUSER, group $OWNER_GROUP, mode 2750, group reads it)"
+  say "helper     : $SELF (already present here)"
+  say "unit       : guardrail-proxy.service, guardrail-sync.timer, guardrail-net.service"
+  if [ "$enable_units" = 1 ]; then
+    say "            will be ENABLED, so it starts by itself on every boot"
+  else
+    say "            written but NOT enabled; nothing starts by itself after a boot"
+  fi
+  if [ "$do_arm" = 1 ]; then
+    say "rule       : will be INSTALLED now, port $PORT, failsafe $dur, persist=$([ "$persist" = 1 ] && echo yes || echo no)"
+    say "            then checked end to end; if that fails the rule removes itself"
+  else
+    say "rule       : NOT installed (default); your traffic is not diverted until you run arm"
+  fi
+  say "CA         : $([ -f "$USER_HOME/.mitmproxy/mitmproxy-ca.pem" ] && echo "copied from $USER_HOME/.mitmproxy" || echo "created new by mitmdump in $CONFDIR")"
+  [ "$with_model" = 1 ] && say "option     : the language-model layer is installed too; weights are copied from ${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub} into $HFDIR if they match their pinned sha256"
+  say ""
+  say "after the real install, run:"
+  say "  bash $APP/run.sh verify"
+  say "  sudo /usr/local/sbin/guardrail-adm verify"
+  say "  sudo /usr/local/sbin/guardrail-adm status"
+}
+
+
+# payload: dirs, app copy, plan, venv, CA, trust
+install_payload() {
+  local with_model="$1"
+  make_dirs
+  logrotate_install
+  copy_app
+  load_plan
+  build_venv "$with_model"
+  # no model degrades the proxy; install goes on
+  if [ "$with_model" = 1 ]; then
+    install_model "${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub}" \
+      || say "WARNING: no model layer; free-form names that escape the regex rules pass unmasked"
+  fi
+  install_ca
+  install_trust
+}
+
+# an earlier proxy, root or run.sh, gets replaced
+install_swap_proxy() {
+  proxy_up || return 0
+  case " $(listener_users) " in
+    *" $PUSER "*) [ "${APP_CHANGED:-0}${VENV_CHANGED:-0}" = 00 ] || proxy_stop ;;
+    *) say "stopping the proxy on $PORT run as: $(listener_users)"; proxy_stop ;;
+  esac
+}
+
+# write units or a runner; boot start is never automatic
+install_boot_units() {
+  local enable_units="$1"
+  if [ "$HAS_SYSTEMD" = 1 ]; then
+    ensure_table
+    units_install
+    systemctl start guardrail-sync.timer
+    if [ "$enable_units" = 1 ]; then
+      if systemctl enable guardrail-proxy.service guardrail-sync.timer >/dev/null 2>&1; then
+        say "units enabled: the proxy and the sync timer start at boot"
+      else
+        say "WARNING: could not enable the units; start them by hand after a reboot"
+      fi
+    else
+      say "units written but not enabled: nothing starts at boot"
+      say "  make them permanent with: sudo $SELF units-enable"
+    fi
+  else
+    pin_owner
+    write_runner
+    say "no systemd ($GR_INIT): the proxy starts now through runuser/setpriv and does not return after a reboot"
+  fi
+}
+
+install_all() {
+  local with_model=1 persist=0 enable_units=0 dry=0 do_arm=0 dur=15m a
+  for a in "$@"; do
+    case "$a" in
+      --with-model) with_model=1 ;;
+      --model-src=*) MODEL_SRC="${a#--model-src=}" ;;
+      --no-deps) NO_DEPS=1 ;;
+      --persist) persist=1 ;;
+      --enable-units) enable_units=1 ;;
+      --dry-run) dry=1 ;;
+      --arm) do_arm=1 ;;
+      --failsafe=*) dur="${a#--failsafe=}" ;;
+      *) die "install: unknown option $a" ;;
+    esac
+  done
+  [ "$DEV" = 1 ] && die "install never runs in --dev mode"
+  [ "$do_arm" != 1 ] || arm_window_ok "$dur"
+  install_deps "$dry" || die "prerequisites are incomplete; install them and run install again"
+  need_sudo_tool; need_app; need_nft; need_python
+  command -v ss >/dev/null 2>&1 || die "ss not found: install iproute2"
+  [ "$(failsafe_method)" != none ] || die "no systemd and no setsid/sleep: the rule could not remove itself; nothing installed"
+  if [ "$dry" = 1 ]; then dry_run_report "$with_model" "$persist" "$enable_units" "$dur"; exit 0; fi
+  say "== install for owner $OWNER (uid $UID_TARGET), source $APP"
+  need_puser
+  install -d -o root -g root -m 0755 /etc/guardrail
+  : >"$RECORD.new"
+  chmod 0644 "$RECORD.new"
+  record_add OWNER_UID "$UID_TARGET"
+  install_payload "$with_model"
+  install_swap_proxy
+  install_boot_units "$enable_units"
+  proxy_start
+  if [ "$do_arm" = 1 ]; then
+    arm "$dur"
+  else
+    say "rule NOT armed: nothing of yours is diverted yet"
+    say "  arm it when you are ready: sudo $SELF arm $dur"
+    say "  note: clients that were already running may not trust the CA until you log out and back in"
+  fi
+  if [ "$do_arm" = 1 ] && [ "$persist" = 1 ] && [ "$HAS_SYSTEMD" = 1 ]; then
+    # never save an empty ruleset over a good one
+    if $NFT list table inet guardrail >/etc/guardrail/guardrail.nft.new 2>/dev/null \
+       && [ -s /etc/guardrail/guardrail.nft.new ]; then
+      mv -f /etc/guardrail/guardrail.nft.new /etc/guardrail/guardrail.nft
+    else
+      rm -f /etc/guardrail/guardrail.nft.new
+      say "WARNING: the ruleset could not be saved; guardrail-net.service has nothing to load"
+    fi
+    # A persisted rule needs the listener it points at
+    if systemctl enable guardrail-proxy.service guardrail-sync.timer guardrail-net.service >/dev/null 2>&1
+    then
+      say "rule persisted: guardrail-net.service, the proxy and the sync timer start at boot"
+      say "  note: the armed failsafe still releases the rule in this session after $dur"
+      say "  note: after a reboot the rule is installed again, with no dead-man switch"
+    else
+      say "rule NOT persisted: the units could not be enabled; run: sudo $SELF units-enable"
+    fi
+  else
+    say "rule not persisted: it lives until the failsafe fires in $dur (use --persist to keep it)"
+  fi
+  mv -f "$RECORD.new" "$RECORD"; chmod 0644 "$RECORD"
+  echo
+  if [ "$do_arm" = 1 ]; then
+    verify
+  else
+    say "install complete; the rule is not armed (arm it with: sudo $SELF arm)"
+    say "check the install read-only: bash $APP/run.sh verify"
+  fi
+}
+
+yaml_loader_line() {
+  # prints the loader line; fallback warns, never fails
+  case "$1" in
+    CSafeLoader) printf '  yaml loader        : CSafeLoader\n' ;;
+    *) printf '  NOTE  yaml loader : %s (pure-Python fallback; loading the rules is about six times slower, measured 6.1 s against 1.0 s on 825 files; the rules loaded are the same)\n' "$1" ;;
+  esac
+}
+
+verify() {
+  local fail=0 p fp_conf fp_cert fp_pub fp_anchor fp_src rules ru=0 tbl
+  ok() { printf '  OK    %s\n' "$*"; }
+  bad() { printf '  FAIL  %s\n' "$*"; fail=1; }
+  note() { printf '  NOTE  %s\n' "$*"; }
+  echo "== verify"
+  if puser_exists; then ok "user: $(id "$PUSER"), shell $(getent passwd "$PUSER" | cut -d: -f7)"
+  else bad "user $PUSER missing"; fi
+  # venv python runs as root only after tree_ok passed
+  if [ ! -x "$VENV/bin/python" ]; then bad "venv $VENV missing"
+  elif ! tree_ok "$VENV" 1; then bad "venv not run: $BAD"
+  else
+    ok "venv: $("$VENV/bin/python" -I -c 'import importlib.metadata as m, sys; print("python", sys.version.split()[0], "mitmproxy", m.version("mitmproxy"))' 2>&1)"
+    yaml_loader_line "$("$VENV/bin/python" -I -c 'import yaml; print(getattr(yaml, "CSafeLoader", yaml.SafeLoader).__name__)' 2>&1)"
+    if "$VENV/bin/python" -I -c 'import importlib.util as u, sys; sys.exit(0 if u.find_spec("gliner") else 1)' 2>/dev/null; then
+      if [ ! -d "$HFDIR" ]; then bad "model layer: gliner is installed but $HFDIR is missing, so free-form names pass unmasked"
+      elif ! tree_ok "$HFDIR"; then bad "model layer: $BAD"
+      elif model_check "$HFDIR"; then ok "model weights match their pinned checksums: $(describe "$HFDIR")"
+      else bad "model layer: $BAD"; fi
+    else note "model layer not installed (install --with-model); free-form names are not masked"; fi
+  fi
+  for p in "$LIBDIR" "$VENV" "$IAPP" "$RUNNER" "$CA_PUB"; do
+    # the venv lives inside LIBDIR and always holds links
+    case "$p" in "$VENV"|"$LIBDIR") links=1 ;; *) links=0 ;; esac
+    if [ -d "$p" ]; then tree_ok "$p" "$links" \
+      && ok "root-only: $(describe "$p")" || bad "$BAD"
+    elif [ -e "$p" ]; then chain_ok "$p" && ok "root-only: $(describe "$p")" || bad "$BAD"
+    else bad "$p missing"; fi
+  done
+  puser_dir_ok "$CONFDIR" 700 && ok "proxy-only: $(describe "$CONFDIR")" || bad "$BAD"
+  puser_dir_ok "$STATE" 750 && ok "proxy-only: $(describe "$STATE")" || bad "$BAD"
+  audit_dir_ok && ok "audit dir: $(describe "$LOGDIR")" || bad "$BAD"
+  if [ -f "$LOGDIR/audit.jsonl" ]; then
+    if [ "$(stat -c '%G %a' "$LOGDIR/audit.jsonl")" = "$OWNER_GROUP 640" ]; then
+      ok "audit file: $(describe "$LOGDIR/audit.jsonl")"
+    else
+      bad "$(describe "$LOGDIR/audit.jsonl"), expected group $OWNER_GROUP mode 640"
+    fi
+  else bad "$LOGDIR/audit.jsonl missing"; fi
+  fp_conf="$(as_puser cat "$CONFDIR/mitmproxy-ca.pem" 2>/dev/null | cert_fp)"
+  fp_cert="$(as_puser cat "$CONFDIR/mitmproxy-ca-cert.pem" 2>/dev/null | cert_fp)"
+  fp_pub="$(cert_fp <"$CA_PUB" 2>/dev/null)"
+  fp_anchor="$(p="$(rec_get ANCHOR | tail -1)"; [ -n "$p" ] && cert_fp <"$p" 2>/dev/null)"
+  fp_src="$([ -n "$OWNER" ] && as_owner cat "$USER_HOME/.mitmproxy/mitmproxy-ca.pem" 2>/dev/null | cert_fp)"
+  echo "  CA sha256 key file : ${fp_conf:-none}"
+  echo "  CA sha256 cert     : ${fp_cert:-none}"
+  echo "  CA sha256 public   : ${fp_pub:-none}"
+  echo "  CA sha256 anchor   : ${fp_anchor:-none}"
+  echo "  CA sha256 source   : ${fp_src:-none} ($USER_HOME/.mitmproxy)"
+  if [ -n "$fp_conf" ] && [ "$fp_conf" = "$fp_pub" ] && { [ -z "$fp_cert" ] || [ "$fp_cert" = "$fp_conf" ]; } \
+     && { [ -z "$fp_anchor" ] || [ "$fp_anchor" = "$fp_conf" ]; } && { [ -z "$fp_src" ] || [ "$fp_src" = "$fp_conf" ]; }; then
+    ok "one CA identity everywhere it is present"
+  else bad "CA fingerprints differ or the CA is missing"; fi
+  case "$(proxy_listeners)" in
+    1:1) ok "listeners IPv4 and IPv6 on $PORT, as: $(listener_users)" ;;
+    0:0) bad "listeners IPv4:IPv6 = 0:0 on $PORT: the proxy is not running; 'guardrail-adm proxy-start' starts it" ;;
+    *) bad "listeners IPv4:IPv6 = $(proxy_listeners) on $PORT" ;;
+  esac
+  listener_is_root "$(listener_users)" && bad "a listener on $PORT runs as root"
+  if [ -n "$NFT" ]; then
+    if tbl="$($NFT list table inet guardrail 2>/dev/null)"; then
+      rules="$(grep -cE 'redirect to|udp dport 443 .* (drop|reject)' <<<"$tbl")"
+    elif nft_absent; then rules=0
+    else rules=0; ru=1
+    fi
+    if [ "$ru" = 1 ]; then bad "rule state unknown: nft could not be read, so diversion is neither confirmed nor ruled out"
+    elif [ "${rules:-0}" -ge 4 ]; then ok "rule: $rules redirect/reject lines in inet guardrail"
+    elif [ "${rules:-0}" = 0 ]; then note "rule not installed: nothing is diverted yet (arm it: sudo $SELF arm 15m)"
+    else bad "rule: ${rules:-0} redirect/reject lines (expected 4)"
+    fi
+  else bad "nft missing"; fi
+  if [ "$HAS_SYSTEMD" = 1 ]; then
+    systemctl list-timers --all 'guardrail*' --no-pager 2>&1 | sed -n '1,4p' | sed 's/^/  /'
+    if systemctl is-active --quiet "$UNIT.timer"; then ok "failsafe timer active"
+    elif [ "$ru" = 0 ] && [ "${rules:-0}" = 0 ]; then note "no failsafe timer while nothing is diverted"
+    else bad "failsafe timer not active"
+    fi
+    echo "  units: proxy $(systemctl is-enabled guardrail-proxy.service 2>&1)/$(systemctl is-active guardrail-proxy.service 2>&1), sync timer $(systemctl is-enabled guardrail-sync.timer 2>&1), net $(systemctl is-enabled guardrail-net.service 2>&1)"
+  elif [ -f "$FSPID" ] && kill -0 "$(cat "$FSPID")" 2>/dev/null; then ok "background failsafe pid $(cat "$FSPID")"
+  else bad "no failsafe armed"; fi
+  # only check owner request when a rule is installed
+  if [ "$ru" = 1 ]; then
+    say "  note: rule state unknown, so the owner-request check was not run"
+  elif [ -n "$NFT" ] && [ "${rules:-0}" -ge 4 ]; then
+    if e2e_check; then ok "owner request through the guardrail: reached the provider and was recorded"
+    else bad "owner request through the guardrail failed; consider: $SELF disarm"
+    fi
+  else
+    say "  note: no redirect rule installed, so the owner-request check is skipped (nothing is diverted)"
+  fi
+  [ "$fail" = 0 ] && say "verify: all checks passed" || say "verify: FAILED (see FAIL lines)"
+  return "$fail"
+}
+
+uninstall() {
+  local l u d upd=()
+  [ "$DEV" = 1 ] && die "uninstall never runs in --dev mode"
+  if [ -n "$NFT" ]; then
+    $NFT delete table inet guardrail 2>/dev/null && say "table inet guardrail deleted"
+    # a standing rule keeps its failsafe and proxy
+    if $NFT list table inet guardrail >/dev/null 2>&1; then
+      die "the nft table could not be deleted; failsafe and proxy are left running"
+    fi
+  fi
+  failsafe_cancel
+  proxy_stop
+  rm -f "$LOGROTATE_FILE"
+  units_remove
+  rm -f "$UNITDIR/$UNIT.service" "$UNITDIR/$UNIT.timer"
+  [ "$HAS_SYSTEMD" = 1 ] && systemctl daemon-reload
+  # undo what install recorded, including half-done runs
+  read -ra upd <<<"$(rec_get UPDATE | tail -1)"
+  while IFS= read -r l; do
+    if [ -f "$l" ] && { [ ! -f "$CA_PUB" ] || cmp -s "$l" "$CA_PUB"; }; then rm -f "$l"; say "trust anchor $l removed"
+      [ "${#upd[@]}" -gt 0 ] && "${upd[@]}" >/dev/null 2>&1 && say "${upd[*]} ran"
+    fi
+  done < <(rec_get ANCHOR)
+  while IFS= read -r l; do
+    [ -f "$CA_PUB" ] && "$l" anchor --remove "$CA_PUB" >/dev/null 2>&1 && say "p11-kit anchor removed"
+  done < <(rec_get P11KIT)
+  while IFS= read -r l; do
+    u="${l%%:*}"; d="${l#*:}"
+    id "$u" >/dev/null 2>&1 && command -v certutil >/dev/null 2>&1 \
+      && as_user "$u" certutil -d "sql:$d" -D -n guardrail 2>/dev/null && say "NSS: guardrail removed from $d ($u)"
+  done < <(rec_get NSS)
+  while IFS= read -r l; do
+    case "$l" in /etc/environment.d/*guardrail*|/etc/profile.d/*guardrail*) rm -f "$l" && say "removed $l" ;; esac
+  done < <(rec_get ENVFILE)
+  if [ "${KEEP_AUDIT:-0}" = 1 ]; then
+    rm -rf "$LIBDIR" "$VARDIR" && say "removed $LIBDIR $VARDIR; $LOGDIR kept"
+  else
+    rm -rf "$LIBDIR" "$VARDIR" "$LOGDIR" && say "removed $LIBDIR $VARDIR $LOGDIR"
+  fi
+  if puser_exists; then
+    pkill -u "$PUSER" 2>/dev/null; sleep 0.5; pkill -9 -u "$PUSER" 2>/dev/null
+    { userdel "$PUSER" 2>/dev/null || deluser "$PUSER" 2>/dev/null; } && say "$PUSER removed"
+    getent group "$PUSER" >/dev/null 2>&1 && { groupdel "$PUSER" 2>/dev/null || delgroup "$PUSER" 2>/dev/null; }
+  fi
+  rm -f "$RECORD" "$RECORD.new" "$PIDFILE"
+  say "uninstall done; the helper, the sudoers entry, /etc/guardrail and $USER_HOME/.mitmproxy are left (revoke removes the helper)"
+}
+
+# the app copy before the last changing install
+app_prev_ok() { [ -f "$IAPP.prev/guardrail.py" ] && tree_ok "$IAPP.prev"; }
+
+rollback() {
+  local was_up=0 stamp
+  if app_prev_ok; then
+    # logs, venv and CA stay
+    disarm
+    proxy_up && was_up=1
+    proxy_stop
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    mv "$IAPP" "$IAPP.rolled-$stamp"
+    mv "$IAPP.prev" "$IAPP"
+    if ! tree_ok "$IAPP"; then
+      rm -rf "$IAPP"; mv "$IAPP.rolled-$stamp" "$IAPP"
+      die "the previous app failed its own check: $BAD; the current app is back"
+    fi
+    mv "$IAPP.rolled-$stamp" "$IAPP.prev"
+    say "rollback: app restored from $IAPP.prev; $LOGDIR left alone"
+    if [ "$was_up" = 1 ]; then proxy_start "$PUSER"; else say "the proxy was not running; start it with: sudo $SELF proxy-start"; fi
+    return 0
+  fi
+  if [ -d "$LIBDIR" ] || [ -d "$VARDIR" ] || [ -f "$RECORD" ]; then
+    say "rollback: no previous app copy, so this removes the install; the audit log is kept"
+    KEEP_AUDIT=1 uninstall
+  else
+    disarm
+    proxy_stop
+    units_remove
+    [ -n "$NFT" ] && $NFT delete table inet guardrail 2>/dev/null && say "table inet guardrail deleted"
+    rm -f "$UNITDIR/$UNIT.service" "$UNITDIR/$UNIT.timer"
+    [ "$HAS_SYSTEMD" = 1 ] && systemctl daemon-reload
+    { userdel "$PUSER" 2>/dev/null || deluser "$PUSER" 2>/dev/null; } && say "$PUSER removed"
+  fi
+  rm -rf /etc/guardrail
+  say "rollback done; the CA anchor, NSS entry and environment.d from phase 3 are left alone"
+}
+
+# ---- CA trust on its own: check, place again, remove -------------------------------------------
+
+# stop unless install has placed the public CA
+ca_need_pub() {
+  [ -f "$CA_PUB" ] || die "no CA certificate at $CA_PUB yet; install first: sudo bash <tree>/guardrail-adm install"
+}
+
+# read-only; fails when no system store trusts the CA
+ca_status() {
+  local fp trusted=0 entry u d marker bundle_has
+  ca_need_pub
+  load_plan
+  fp="$(cert_fp <"$CA_PUB")"
+  bundle_has=1
+  # anchor-dir file counts only once the bundle has it
+  [ -n "$GR_CA_BUNDLE" ] && ! grep -qF "$(sed -n 2p "$CA_PUB")" "$GR_CA_BUNDLE" && bundle_has=0
+  say "CA certificate : $CA_PUB (public part, copy this one to other machines)"
+  say "CA private key : $CONFDIR (account $PUSER only, never copied)"
+  say "CA sha256      : $fp"
+  case "$GR_CA_METHOD" in
+    anchor-dir)
+      if [ ! -f "$GR_CA_ANCHOR" ]; then say "system anchor  : ABSENT ($GR_CA_ANCHOR)"
+      elif cmp -s "$CA_PUB" "$GR_CA_ANCHOR"; then
+        if [ "$bundle_has" = 1 ]; then say "system anchor  : trusted ($GR_CA_ANCHOR)"; trusted=1
+        else say "system anchor  : file present, bundle not rebuilt (run ca-trust)"; fi
+      else say "system anchor  : DIFFERENT certificate at $GR_CA_ANCHOR"; fi ;;
+    p11-kit)
+      if "$GR_CA_P11KIT" list 2>/dev/null | grep -qi 'label: mitmproxy'; then
+        say "system anchor  : trusted (p11-kit)"; trusted=1
+      else say "system anchor  : ABSENT (p11-kit)"; fi ;;
+    *) say "system anchor  : no store known here (${GR_CA_SKIP:-unknown})" ;;
+  esac
+  if [ -n "$GR_CA_BUNDLE" ]; then
+    marker="$(sed -n 2p "$CA_PUB")"
+    if grep -qF "$marker" "$GR_CA_BUNDLE"; then say "system bundle  : carries the CA ($GR_CA_BUNDLE)"; trusted=1
+    else say "system bundle  : does not carry the CA ($GR_CA_BUNDLE)"; fi
+  fi
+  if [ -z "$GR_CERTUTIL" ]; then say "browser stores : certutil not found, cannot read NSS stores"
+  else
+    for entry in "${GR_NSS_DBS[@]}"; do
+      u="${entry%%:*}"; d="${entry#*:}"
+      if as_user "$u" "$GR_CERTUTIL" -d "sql:$d" -L -n guardrail >/dev/null 2>&1; then say "browser store  : trusted in $d ($u)"
+      else say "browser store  : ABSENT in $d ($u)"; fi
+    done
+    [ "${#GR_NSS_DBS[@]}" -gt 0 ] || say "browser stores : none found (open the browser once, then re-run)"
+  fi
+  if [ -n "$GR_ENV_FILE" ] && [ -f "$GR_ENV_FILE" ] && grep -q NODE_EXTRA_CA_CERTS "$GR_ENV_FILE"; then
+    say "runtime vars   : $GR_ENV_FILE"
+  else say "runtime vars   : ABSENT (${GR_ENV_FILE:-no place})"; fi
+  [ "$trusted" = 1 ]
+}
+
+# place the trust again; nothing else changes
+ca_trust() {
+  ca_need_pub
+  load_plan
+  # keep what an earlier install recorded
+  install -d -o root -g root -m 0755 "$(dirname "$RECORD")"
+  if [ -f "$RECORD" ]; then cp -p "$RECORD" "$RECORD.new"; else : >"$RECORD.new"; fi
+  chmod 0644 "$RECORD.new"
+  install_trust
+  awk '!seen[$0]++' "$RECORD.new" >"$RECORD.tmp" && mv -f "$RECORD.tmp" "$RECORD" && rm -f "$RECORD.new"
+  chmod 0644 "$RECORD"
+  ca_status
+}
+
+# remove trust from recorded stores; install stays
+ca_untrust() {
+  local l u d upd=() n=0
+  read -ra upd <<<"$(rec_get UPDATE | tail -1)"
+  while IFS= read -r l; do
+    if [ -f "$l" ] && { [ ! -f "$CA_PUB" ] || cmp -s "$l" "$CA_PUB"; }; then
+      rm -f "$l"; say "trust anchor $l removed"; n=$((n + 1))
+      [ "${#upd[@]}" -gt 0 ] && "${upd[@]}" >/dev/null 2>&1 && say "${upd[*]} ran"
+    fi
+  done < <(rec_get ANCHOR)
+  while IFS= read -r l; do
+    [ -f "$CA_PUB" ] && "$l" anchor --remove "$CA_PUB" >/dev/null 2>&1 && { say "p11-kit anchor removed"; n=$((n + 1)); }
+  done < <(rec_get P11KIT)
+  while IFS= read -r l; do
+    u="${l%%:*}"; d="${l#*:}"
+    id "$u" >/dev/null 2>&1 && command -v certutil >/dev/null 2>&1 \
+      && as_user "$u" certutil -d "sql:$d" -D -n guardrail 2>/dev/null && { say "NSS: guardrail removed from $d ($u)"; n=$((n + 1)); }
+  done < <(rec_get NSS)
+  while IFS= read -r l; do
+    case "$l" in /etc/environment.d/*guardrail*|/etc/profile.d/*guardrail*) rm -f "$l" && { say "removed $l"; n=$((n + 1)); } ;; esac
+  done < <(rec_get ENVFILE)
+  [ "$n" -gt 0 ] || say "nothing recorded to remove; the install record names no trust entries"
+  say "trust removed; the CA files stay (ca-trust puts it back, uninstall removes them)"
+}
+
+case "${1:-}" in
+  install)
+    shift
+    case " $* " in
+      # plan only: nothing written first, not even the helper
+      *" --dry-run "*) ;;
+      *) [ "$DEV" = 0 ] && [ "$SELF" != "$HELPER_PATH" ] && self_install "$@" ;;
+    esac
+    install_all "$@"
+    ;;
+  uninstall) uninstall ;;
+  verify) verify ;;
+  requirements) [ "${2:-}" = --install ] && [ "$(id -u)" -ne 0 ] && die "requirements --install needs root: sudo $SELF requirements --install"
+                requirements_report || { [ "${2:-}" = --install ] && requirements_install; } ;;
+  status) status ;;
+  set-sync) set_sync; chown_data ;;
+  endpoints) shift; endpoints "$@" ;;
+  mode) need_owner; set_mode "${2:-}" ;;
+  proxy-start) proxy_start "${2:-$PUSER}" ;;
+  proxy-stop) proxy_stop ;;
+  arm) arm "${2:-15m}" ;;
+  disarm) disarm ;;
+  failsafe-fire) failsafe_fire ;;
+  failsafe-test) failsafe_test "${2:-20}" ;;
+  units-install) units_install ;;
+  units-enable) units_enable ;;
+  units-remove) units_remove ;;
+  user-add) user_add ;;
+  journal) show_journal "${2:-}" ;;
+  seal-logs) seal_logs ;;
+  purge-logs) purge_logs ;;
+  revoke) revoke ;;
+  rollback) rollback ;;
+  ca-status) ca_status ;;
+  ca-trust) ca_trust ;;
+  ca-untrust) ca_untrust ;;
+  *) usage; exit 2 ;;
+esac

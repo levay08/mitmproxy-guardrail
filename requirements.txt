@@ -1,0 +1,35 @@
+# What this guardrail needs. Two sections in one file.
+#
+# 1. System tools: checked first, and only what is missing gets installed, using the package
+#    name of the family the installer detected.
+#      name | how to check it | alpine | debian | fedora | suse | arch
+#      command:<name>   the command is on PATH
+#      module:<name>    python3 can import it
+#      run:<command>    the command exits 0
+#
+bash    | command:bash               | bash      | bash            | bash        | bash        | bash
+python3 | command:python3            | python3   | python3         | python3     | python3     | python
+venv    | module:ensurepip                | python3   | python3-venv    | python3     | python3     | python
+pip     | run:python3 -m pip --version | py3-pip | python3-pip     | python3-pip | python3-pip | python-pip
+openssl | command:openssl            | openssl   | openssl         | openssl     | openssl     | openssl
+curl    | command:curl               | curl      | curl            | curl        | curl        | curl
+nft     | command:nft                | nftables  | nftables        | nftables    | nftables    | nftables
+sudo    | command:sudo               | sudo      | sudo            | sudo        | sudo        | sudo
+ss      | command:ss                 | iproute2  | iproute2        | iproute     | iproute2    | iproute2
+pgrep   | command:pgrep              | procps    | procps          | procps-ng   | procps      | procps-ng
+
+# Optional, same format. A missing one never stops an install; it is reported with the command
+# that installs it. notify-send draws the desktop banners; without it the watchdog logs
+# "banner NOT shown" and nothing else changes.
+#
+# notify-send | command:notify-send | libnotify | libnotify-bin | libnotify | libnotify-tools | libnotify
+
+# 2. Python packages for the proxy venv.
+#    The versions are read from the project venv's own dist-info, which is the normal case and the
+#    tested set. The names below are the fallback for a machine that has no venv yet.
+
+mitmproxy
+pyyaml
+python-stdnum
+phonenumbers
+gliner

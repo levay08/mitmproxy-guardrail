@@ -1,0 +1,11 @@
+# Runtime state and build output. The guardrail writes these while it runs; they belong to the
+# machine, not to the repository. The DLP rule data under data/dlp/ is part of the product and stays.
+.venv/
+__pycache__/
+*.pyc
+data/*
+!data/dlp/
+logs/
+proxy.pac
+.tmp/
+ca-bundle.pem

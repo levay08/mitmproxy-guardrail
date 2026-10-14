@@ -1,0 +1,11 @@
+gitleaks_rules: 221
+testpattern_rules: 1235
+privacy_mask_rules: 47
+place_names: 212454
+postal_codes: 10632
+gitleaks.json bytes: 42225
+testpattern.json bytes: 429153
+privacy-mask.json bytes: 5203
+places.txt bytes: 2726519
+postal.txt bytes: 63791
+README.txt bytes: 801

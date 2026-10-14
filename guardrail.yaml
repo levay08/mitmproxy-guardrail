@@ -1,0 +1,155 @@
+# guardrail.yaml - settings for the local guardrail.
+# Edit, save, then restart the guardrail.
+
+providers:
+  # Test media only: these are what the armed pass inspects and exercises.
+  # The working tools (Claude, DeepSeek, the local Hermes provider) are deliberately NOT here:
+  # mitmproxy's allow_hosts is an interception scope, so anything listed can be masked AND blocked.
+  #
+  # Anthropic added 4 Oct 2026: leaving it out is what let an SSH password and an AWS key reach
+  # Claude in clear. In neutral mode (the shipped default) external rules warn and never block and
+  # no dlp rule declares action: block, so listing it buys masking without risking a 403 on the
+  # owner's working tool. Switching mode to persistent makes external rules enforce, so re-read
+  # this line before doing that.
+  - api\.anthropic\.com
+  - console\.anthropic\.com
+  - statsig\.anthropic\.com
+  # Browser chat UIs, added 4 Oct 2026. The PAC is built from this list, so a web
+  # host missing here is never proxied and its prompt leaves in clear: that is how
+  # chat.z.ai produced zero audit records while the owner was testing it.
+  - claude\.ai
+  - chat\.z\.ai
+  - chat\.deepseek\.com
+  - chatglm\.cn
+  - kimi\.moonshot\.cn
+  - (www\.)?kimi\.(ai|com)
+  - api\.moonshot\.ai
+  - tongyi\.aliyun\.com
+  - chat\.qwen\.ai
+  - copilot\.microsoft\.com
+  - (www\.)?perplexity\.ai
+  - poe\.com
+  - api\.openai\.com
+  - chatgpt\.com
+  - openai\.com
+  - generativelanguage\.googleapis\.com
+  - aiplatform\.googleapis\.com
+  - gemini\.google\.com
+  - aistudio\.google\.com
+  - makersuite\.google\.com
+  - cloudcode-pa\.googleapis\.com
+  - api\.x\.ai
+  - grok\.com
+  - api\.mistral\.ai
+  - chat\.mistral\.ai
+  - api\.groq\.com
+  - api\.cohere\.ai
+  - openrouter\.ai
+  - api\.together\.xyz
+  - api\.perplexity\.ai
+  - huggingface\.co
+  - ollama\.com
+  - api\.githubcopilot\.com
+  - copilot-proxy\.githubusercontent\.com
+  - api2?\.cursor\.sh
+  - \.codeium\.com
+  - \.openai\.azure\.com
+  - bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com
+  - dashscope\.aliyuncs\.com
+  - api\.replicate\.com
+  - api\.fireworks\.ai
+  - api\.moonshot\.cn
+  - open\.bigmodel\.cn
+  - aip\.baidubce\.com
+  - 127\.0\.0\.1(:9999|:1143[45])?      # the local mock provider used by the tests
+  - test\.example\.com  # found in use
+  - api\.snapcraft\.io  # found in use
+
+# NAT64 prefixes of the network you are on (IPv6-only networks with DNS64).
+# A client there dials <prefix>+<IPv4> instead of the IPv4 itself; each prefix listed
+# here gets the synthesised form of every watched IPv4 in the v6 set (redirect, QUIC
+# reject) and is exempt from the reset of unknown IPv6. Absent = 64:ff9b::/96 only.
+# Allowed lengths: /32 /40 /48 /56 /64 /96 (RFC 6052). A bad entry is reported by
+# arm or set-sync and skipped; an empty result falls back to the default.
+# The list replaces the default: keep 64:ff9b::/96 in it when you still need it.
+# Read from the installed copy of this file at arm and set-sync.
+# nat64_prefixes:
+#   - 64:ff9b::/96        # well-known prefix (RFC 6052)
+#   - 64:ff9b:1::/48      # local-use prefix (RFC 8215)
+#   - 2001:db8:64::/96    # your operator's prefix, from its DNS64 or 'ipv4only.arpa' AAAA
+
+# Your own data rules, on top of the built-in set.
+# action: mask = token, block = HTTP 403, warn = notify only.
+# group: true = the last bracket group is the secret.
+# notify_in_reply: name masked kinds in the reply too.
+notify_in_reply: true
+
+# DLP data: rule corpora, name lists, validators. false = off.
+# Strictness. neutral = everyday; persistent = strictest.
+# run.sh --mode persistent <command> overrides it for one command.
+mode: neutral
+
+modes:
+  neutral:
+    external: warn          # external rules advise, never block
+    document_block: warn    # a block hit inside tool output warns instead
+    model: audit            # model layer records, does not mask
+    places: false           # city and address names are not masked
+    weak_kinds: [ORGANIZATION, ADDRESS, ALAMAT, KODEPOS, POSTAL, LOCATION, GPE]
+  persistent:
+    external: enforce       # a stable external rule may block
+    document_block: warn    # tool output or an earlier turn never blocks either (owner decision)
+    model: on               # model layer masks
+    places: true            # address and place names are masked
+    weak_kinds: []
+
+# External rule ids recorded but never raising the action on their own: they fire on ordinary
+# vocabulary (a place name, the word "config"). Remove an entry to make it count again.
+# Added after the role suite: 00140 fired on a question about what a reverse shell is, 00142 and
+# 00150 on a deploy log a person pasted while debugging, 00161 on an nginx config, 01902 on
+# "add a few emojis to your answer" (an output rule, and it did not fire on an emoji-heavy answer).
+external_suppress: [ATR-2026-00061, ATR-2026-02818, ATR-2026-00140, ATR-2026-00142,
+                    ATR-2026-00150, ATR-2026-00161, ATR-2026-01902, ATR-2026-00116,
+                    ATR-2026-00001, ATR-2026-00213]
+# 00116 fired on "pass secrets to a container" in a devops question (pass 15).
+# 00001, 00213: "Forget what I said earlier", "ignore the previous message"; 0 of 39 attacks move.
+
+# The proxy adds its own wrapped note to each request and asks the model to end the reply with the
+# token of the action it took. The person never writes a tag.
+proxy_tag: true
+# Only these actions earn a note; a request the proxy left untouched is forwarded without one.
+tag_actions: [MASK, WARN]
+tag_words:
+  MASK: "[G-MASK]"
+  WARN: "[G-WARN]"
+  PASS: "[G-OK]"
+  BLOCK: ""
+
+dlp_data: true
+# Desktop proxy at startup. auto = yes, off = leave it. Keep this off while the proxy runs in
+# transparent mode: a PAC pointing applications at a transparent proxy breaks their AI access
+# (the CONNECT is aborted), and the kernel redirect already covers them.
+desktop_proxy: off
+dlp_budget_ms: 120
+
+dlp:
+  rules:
+    - name: NOMOR_KARYAWAN
+      pattern: '(?i)\bNIK-KRY-[0-9]{6}\b'
+      action: mask
+
+    - name: KODE_OTP
+      pattern: '(?i)\b(?:kode\s+)?otp\b[^\n]{0,12}?\b([0-9]{6})\b'
+      action: mask
+      group: true
+
+    # Uncomment to test a block rule. Keep the pattern narrow.
+    # - name: PROYEK_RAHASIA
+    #   pattern: '(?i)\bproyek\s+merpati\b'
+    #   action: block
+
+# Disable a built-in rule by name, e.g. disable: [SANDI_PANJANG]
+dlp_disable: []
+# Corpus rule ids switched off: they mask ordinary phrases. ai-output-sensitive-disclosure masked
+# "model output", "AI response" and "generated report" in 5 of 116 benign probes (pass 34).
+dlp_data_disable: [ai-output-sensitive-disclosure]
