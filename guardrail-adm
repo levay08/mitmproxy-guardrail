@@ -2264,16 +2264,26 @@ build_venv() {
     rm -rf "$VENV"; [ -d "$VENV.old" ] && mv "$VENV.old" "$VENV"
     die "$py -m venv failed (is the venv module of $py installed?); nothing was switched"
   fi
+  # tested versions as constraints; each line checked like a pin
+  local cons pipdir line extra=()
+  pipdir="$(mktemp -d /var/tmp/guardrail-pip.XXXXXX)" || die "cannot make a pip staging dir under /var/tmp"
+  cons="$pipdir/constraints.txt"; : >"$cons"
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[A-Za-z0-9._-]+==[A-Za-z0-9.+!_-]+$ ]] && printf '%s\n' "$line" >>"$cons"
+  done < <(as_owner cat "$APP/constraints.txt" 2>/dev/null)
+  # CPU-only torch wheel: the default one drags in ~3 GB of CUDA
+  printf '%s\n' "${pins[@]}" | grep -q '^gliner\(==\|$\)' && extra=(--extra-index-url https://download.pytorch.org/whl/cpu)
+  say "pip: $(wc -l <"$cons") constrained versions; staging in $pipdir (disk, not tmpfs)"
   # no config, no cache, no sdist: nothing untrusted as root
-  if ! env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root PIP_CONFIG_FILE=/dev/null \
+  if ! env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root PIP_CONFIG_FILE=/dev/null TMPDIR="$pipdir" \
        "$VENV/bin/python" -I -m pip install --isolated --no-cache-dir --disable-pip-version-check \
-       --no-input --only-binary=:all: "${pins[@]}"; then
-    rm -rf "$VENV"; [ -d "$VENV.old" ] && mv "$VENV.old" "$VENV"
+       --no-input --only-binary=:all: -c "$cons" ${extra[@]+"${extra[@]}"} "${pins[@]}"; then
+    rm -rf "$pipdir" "$VENV"; [ -d "$VENV.old" ] && mv "$VENV.old" "$VENV"
     die "pip could not install ${pins[*]} (no network, or no wheel for this platform).
   Nothing was switched: $([ -d "$VENV" ] && echo "the previous $VENV is back in place" || echo "no venv is installed").
   The project venv is never used instead. Retry when online, or undo with: guardrail-adm uninstall"
   fi
-  rm -rf "$VENV.old"
+  rm -rf "$pipdir" "$VENV.old"
   chown -hR root:root "$VENV"
   chmod -R go-w "$VENV"
   tree_ok "$VENV" 1 || die "the venv failed its own check: $BAD"

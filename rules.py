@@ -492,17 +492,19 @@ def venv_pins(app: Path, with_model: bool = False) -> dict:
             if name and version:
                 versions[_norm(name)] = version
     if not versions:
-# no venv yet: package names come from requirements.txt
-        try:
-            for line in (app / "requirements.txt").read_text(errors="replace").splitlines():
+# no venv yet: tested pins first, bare names after
+        for fname in ("constraints.txt", "requirements.txt"):
+            try:
+                lines = (app / fname).read_text(errors="replace").splitlines()
+            except OSError:
+                continue
+            for line in lines:
                 line = line.strip()
                 if not line or line.startswith("#") or "|" in line:
                     continue
                 name, sep, version = line.partition("==")
                 if name.strip():
-                    versions[_norm(name.strip())] = version.strip() if sep else ""
-        except OSError:
-            pass
+                    versions.setdefault(_norm(name.strip()), version.strip() if sep else "")
     wanted = CORE_PACKAGES + (MODEL_PACKAGES if with_model else ())
 # name only, no version: install it unpinned
     pins = [f"{p}=={versions[p]}" if versions[p] else p for p in wanted if p in versions]
