@@ -875,11 +875,24 @@ apply_sets() {
   fi
 }
 
+# resolve the watched hosts once when no endpoint list exists yet
+seed_endpoints() {
+  local who="$PUSER" home="$STATE" py
+  py="$(dirname "$MITMDUMP")/python"
+  [ "$DEV" = 1 ] && { who="$OWNER"; home="$APP"; }
+  [ -x "$py" ] && [ -n "$who" ] || return 1
+  say "no endpoint list yet: resolving the watched hosts as $who"
+  as_user "$who" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$home" GUARDRAIL_HOME="$home" \
+    GUARDRAIL_CONFIG="$RUN_APP/guardrail.yaml" "$py" -I -c \
+    'import sys; sys.path.insert(0, sys.argv[1]); import rules; sys.exit(0 if rules.ai_endpoint_ips() else 1)' \
+    "$RUN_APP" >/dev/null 2>&1
+}
+
 set_sync() {
   need_python
   local tmp
   tmp="$(mktemp -d)" || die "mktemp failed"
-  sync_collect "$tmp" || { rm -rf "$tmp"; die "no endpoint list: neither ${APP:-the project}/data nor $STATE/data has endpoint-ips.json"; }
+  sync_collect "$tmp" || { seed_endpoints && sync_collect "$tmp"; } || { rm -rf "$tmp"; die "no endpoint list: neither ${APP:-the project}/data nor $STATE/data has endpoint-ips.json"; }
   build_lists "${SYNC_SRCS[@]}" || { rm -rf "$tmp"; die "the address lists could not be built"; }
   rm -rf "$tmp"
   [ -s "$LIST" ] || die "the address list came out empty"
@@ -2787,6 +2800,15 @@ yaml_loader_line() {
   esac
 }
 
+# load the model once, as the proxy user; a failed load is a FAIL
+model_load_check() {
+  local out
+  if out="$(as_puser env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$STATE" HF_HOME="$HFDIR" HF_HUB_OFFLINE=1 \
+      "$VENV/bin/python" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import rules; m = rules._load_model(); print(rules._model_error or "loaded"); sys.exit(0 if m is not None else 1)' \
+      "$IAPP" 2>&1)"; then ok "model loads as $PUSER"
+  else bad "model layer: the model does NOT load, so free-form names pass unmasked: $(printf '%s' "$out" | tail -n 1)"; fi
+}
+
 verify() {
   local fail=0 p fp_conf fp_cert fp_pub fp_anchor fp_src rules ru=0 tbl
   ok() { printf '  OK    %s\n' "$*"; }
@@ -2804,7 +2826,9 @@ verify() {
     if "$VENV/bin/python" -I -c 'import importlib.util as u, sys; sys.exit(0 if u.find_spec("gliner") else 1)' 2>/dev/null; then
       if [ ! -d "$HFDIR" ]; then bad "model layer: gliner is installed but $HFDIR is missing, so free-form names pass unmasked"
       elif ! tree_ok "$HFDIR"; then bad "model layer: $BAD"
-      elif model_check "$HFDIR"; then ok "model weights match their pinned checksums: $(describe "$HFDIR")"
+      elif model_check "$HFDIR"; then
+        ok "model weights match their pinned checksums: $(describe "$HFDIR")"
+        model_load_check
       else bad "model layer: $BAD"; fi
     else note "model layer NOT installed: free-form names pass unmasked (regex and ATR rules still apply); install --with-model"; fi
   fi

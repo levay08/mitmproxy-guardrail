@@ -100,7 +100,7 @@ PROFILE_MARK = "# guardrail-ca: added by " + ME + ", remove this line to undo"
 
 # Proxy packages; first is required, rest are optional layers.
 CORE_PACKAGES = ("mitmproxy", "pyyaml", "python-stdnum", "phonenumbers")
-MODEL_PACKAGES = ("gliner",)
+MODEL_PACKAGES = ("gliner", "protobuf", "sentencepiece")
 
 
 def search_path() -> list:
