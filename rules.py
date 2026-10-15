@@ -803,7 +803,7 @@ ROLE_MAILBOX = re.compile(r"(?i)(?:no[-_.]?reply|do[-_.]?not[-_.]?reply)@[\w-]+(
 
 PII_RULES: list[tuple[str, re.Pattern]] = [
     # Bounded local part; the open form was quadratic.
-    ("EMAIL", re.compile(r"\b[\w.+-]{1,254}@[\w-]+\.[\w.]{2,}\b")),
+    ("EMAIL", re.compile(r"\b[\w.+-]{1,254}@[\w-]+(?:\.[\w-]+)*\.[^\W\d_]{2,}\b")),
     # Emails written as "name (at) domain (dot) tld" or similar.
     ("EMAIL_TERSAMAR", re.compile(r"[A-Za-z0-9._%+-]{1,64}\s*(?:\(at\)|\[at\]|@|\uff20)\s*"
                                   r"[A-Za-z0-9.-]{1,63}\s*(?:\(dot\)|\[dot\]|\.)\s*"
@@ -3716,21 +3716,30 @@ def _load_atr() -> None:
             dropped.append(f"{path.name}: category {category} not in use")
             continue
         compiled: list[tuple[str, re.Pattern]] = []
+        require_all = str((doc.get("detection") or {}).get("condition") or "any").lower() == "all"
+        unusable = 0
         for cond in ((doc.get("detection") or {}).get("conditions") or []):
             if str(cond.get("operator", "")).lower() != "regex":
                 other_conditions += 1
+                unusable += 1
                 continue
             value = cond.get("value")
             if not isinstance(value, str):
                 other_conditions += 1
+                unusable += 1
                 continue
             try:
                 compiled.append((str(cond.get("field") or ATR_CHANNEL_USER),
                                  re.compile(value, re.I)))
             except re.error as exc:
                 skipped.append(f"{path.name}: bad regex ({exc})")
+                unusable += 1
         if not compiled:
             dropped.append(f"{path.name}: no usable regex condition")
+            continue
+        if require_all and unusable:
+            # a partial AND would fire far wider than written
+            dropped.append(f"{path.name}: condition all with an unusable condition")
             continue
         conditions += len(compiled)
         maturity = str(doc.get("maturity") or "test").lower()
@@ -3743,6 +3752,7 @@ def _load_atr() -> None:
             "lane": overrides.get(str(doc.get("id") or path.stem),
                                   "enforce" if maturity == "stable" else "hunt"),
             "patterns": compiled,
+            "require_all": require_all,
         })
     _atr_rules = rules
     _atr_skipped = skipped
@@ -3818,7 +3828,14 @@ def check_atr(text: str, channel: str = ATR_CHANNEL_USER) -> list[dict]:
         return hits
     wanted = CHANNEL_FIELDS.get(channel, {channel})
     for rule in _atr_rules:
-        for field, pattern in rule["patterns"]:
+        if rule.get("require_all"):
+            # condition: all means every regex must match this text
+            if not all(f in wanted and p.search(text) for f, p in rule["patterns"]):
+                continue
+            pairs = rule["patterns"][:1]
+        else:
+            pairs = rule["patterns"]
+        for field, pattern in pairs:
             if field not in wanted:
                 continue
             found = _window(text, pattern)
