@@ -912,7 +912,7 @@ WARN_IF_QUESTION = {"destructive_command"}
 # Always-warn rules, from guardrail.yaml and its always_warn list.
 
 # Owner asked for a warning (1 Oct 2026).
-ALWAYS_WARN: set[str] = {"unbounded_request", "output_abuse", "excessive_repetition",
+ALWAYS_WARN: set[str] = {"installer_pipe_known_host", "curl_pipe_in_substitution", "unbounded_request", "output_abuse", "excessive_repetition",
                          "indirect_injection", "conceal_from_user",
                          "jailbreak_paraphrase", "safety_bypass", "exfil_markdown_image"}
 # Raised to block: 0 of 198 benign hits.
@@ -1181,7 +1181,7 @@ MALICIOUS_RULES: list[tuple[str, re.Pattern]] = [
     ("fake_system_message",
      re.compile(r"(?i)(?:akhir\s+input(?:\s+pengguna)?|end\s+of\s+(?:user\s+)?input)\W{0,20}\[(?:sistem|system)\]\s*:")),
     ("obfuscated",
-     re.compile(r"(?i)\brot13\b|\bbase64\s*(?:decode|decoding|kan)\b")),
+     re.compile(r"(?i)\bbase64\s*(?:decode|decoding|kan)\b")),
     # Pass 14: structural families, not phrase lists.
     ("jailbreak_override",
      re.compile(r"(?i)\b(?:treat|consider|regard|count|take)\s+(?:everything|all|anything|whatever)\s+(?:that\s+)?(?:the\s+)?"
@@ -1509,7 +1509,8 @@ MALICIOUS_RULES: list[tuple[str, re.Pattern]] = [
     ("malware_request",
      re.compile(r"(?i)\b(?:buat(?:kan|lah)?|bikin(?:kan|lah)?|tulis(?:kan|lah)?|beri(?:kan|lah)?"
                 r"|kasih(?:kan|lah)?|hasilkan|generate|write|create|make|give|provide|build)\b"
-                r"[^.\n]{0,60}?\b(?:keylogger|ransomware|rootkit|botnet|reverse\s+shell"
+                r"(?:(?!\b(?:yara|sigma|snort|suricata)\b|\bfor\s+(?:detect\w*|identif\w+|scann\w+|remov\w+)\b)[^.\n]){0,60}?"
+                r"\b(?:keylogger|ransomware|rootkit|botnet|reverse\s+shell"
                 r"|credential\s+stealer|pencuri\s+kredensial|malware)\b")),
     ("malware_request",
      re.compile(r"(?i)\b(?:keylogger|ransomware|rootkit|botnet|reverse\s+shell|credential\s+stealer)\b"
@@ -1530,7 +1531,11 @@ MALICIOUS_RULES: list[tuple[str, re.Pattern]] = [
     ("destructive_command",
      re.compile(r"(?i)\bmkfs(?:\.[a-z0-9]+)?\s|\bdd\s+if=[^\s]{0,40}\s+of=/dev/(?:sd|nvme|vd|hd)")),
     ("destructive_command",
-     re.compile(r"(?i)\b(?:curl|wget)\b[^\n|]{0,140}\|\s*(?:sudo\s+)?(?:ba|z|k)?sh\b")),
+     re.compile(r"(?i)(?<!\$\()\b(?:curl|wget)\b(?![^\n|]{0,140}?https?://(?:get\.docker\.com|sh\.rustup\.rs|install\.python-poetry\.org|example\.(?:com|org))[/:\s\"'])[^\n|]{0,140}\|\s*(?:sudo\s+)?(?:ba|z|k)?sh\b")),
+    ("curl_pipe_in_substitution",
+     re.compile(r"(?i)\$\(\s*(?:curl|wget)\b[^\n|]{0,140}\|\s*(?:sudo\s+)?(?:ba|z|k)?sh\b")),
+    ("installer_pipe_known_host",
+     re.compile(r"(?i)\b(?:curl|wget)\b(?=[^\n|]{0,140}?https?://(?:get\.docker\.com|sh\.rustup\.rs|install\.python-poetry\.org|example\.(?:com|org))[/:\s\"'])[^\n|]{0,140}\|\s*(?:sudo\s+)?(?:ba|z|k)?sh\b")),
     ("destructive_command",
      re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:")),  # fork bomb
     ("destructive_request",
@@ -1728,6 +1733,12 @@ def _decoded_blobs(text: str) -> list[str]:
     return found
 
 
+EXAMPLE_LEAD = re.compile(r"(?i)(?:\blike|such\s+as|e\.g\.?|for\s+(?:example|instance))\s*[\"'`\u201c]?[^\"'`\u201d]{0,40}$")
+
+
+DISCUSS_AFTER = re.compile(r"(?i)\s+(?:technique|attack|trick|method|phrase|jailbreak|prompt\s+injection)\b")
+
+
 def find_malicious(text: str, _decoded: bool = False) -> list[tuple[str, str, str]]:
     """List (rule, excerpt, level) for each malicious pattern that matches."""
     hits: list[tuple[str, str, str]] = []
@@ -1740,6 +1751,13 @@ def find_malicious(text: str, _decoded: bool = False) -> list[tuple[str, str, st
                 and not _obey_quoted(text, m):
             # quoted words are read, never obeyed (owner, 4 Oct)
             hits.append((rule, m.group(0).strip()[:60], "note"))
+            continue
+        if rule == "destructive_command" and _quoted(text, m) and EXAMPLE_LEAD.search(text[max(0, m.start() - 60):m.start()]):
+            hits.append((rule, m.group(0).strip()[:60], "warn"))
+            continue
+        if rule == "jailbreak_override" and DISCUSS_AFTER.match(text[m.end():m.end() + 40]) \
+                and _question_near(text, m):
+            hits.append((rule, m.group(0).strip()[:60], "warn"))
             continue
         level = ("warn" if (rule in ALWAYS_WARN
                            or (rule in WARN_IF_QUESTION and _question_near(text, m))
@@ -1757,6 +1775,12 @@ def find_malicious(text: str, _decoded: bool = False) -> list[tuple[str, str, st
                 lane = "block" if any(h[2] == "block" for h in inner) else "warn"
                 hits.append(("obfuscated", f"base64: {inner[0][0]}", lane))
                 break
+    if not _decoded and re.search(r"(?i)\brot13\b", text):
+        import codecs
+        inner = [h for h in find_malicious(codecs.decode(text, "rot13"), True) if h[2] in ("block", "warn")]
+        if inner:
+            lane = "block" if any(h[2] == "block" for h in inner) else "warn"
+            hits.append(("obfuscated", f"rot13: {inner[0][0]}", lane))
     return hits
 
 
