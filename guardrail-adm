@@ -443,6 +443,7 @@ requirements_install() {
           | grep -viE '\.(rpm|deb|apk|pkg\.tar)' | sort -u | tr '\n' ' ')"
   [ -n "$pkgs" ] || { say "nothing installable in that list; check the prerequisite table"; return 1; }
   cmd="$(pkg_command "$family")"
+  pkg_forecast "$family" prerequisites $pkgs
   say "installing: $cmd $pkgs"
   if pkg_try "$family" $cmd $pkgs; then
     say "prerequisites installed"
@@ -451,6 +452,20 @@ requirements_install() {
     return 1
   fi
   return 0
+}
+
+# Size of an apt install, printed before apt runs: a forecast.
+pkg_forecast() {
+  local family="$1" label="$2" out; shift 2
+  if [ "$family" != debian ]; then
+    say "download   : $label: unknown size (not sized ahead on $family)"; return 0
+  fi
+  apt-get -o Acquire::Retries=3 update >/dev/null 2>&1
+  out="$(cd / && env DEBIAN_FRONTEND=noninteractive apt-get --print-uris -y -o Debug::NoLocking=1 \
+         install --no-install-recommends "$@" 2>/dev/null </dev/null \
+         | awk '/^.http/{n++; s+=$3} END{if (n) printf "%d packages, about %.1f MB", n, s/1e6}')"
+  if [ -n "$out" ]; then say "download   : apt $label: $out"
+  else say "download   : apt $label: unknown size"; fi
 }
 
 # index refresh, three tries, backoff
@@ -477,6 +492,7 @@ optional_install() {
   pkgs="$(printf '%s' "$opt" | awk '{print $2}' | grep -xE '[A-Za-z0-9][A-Za-z0-9+_-]*' | sort -u | tr '\n' ' ')"
   [ -n "$pkgs" ] || return 0
   cmd="$(pkg_command "$family")"
+  pkg_forecast "$family" "optional tools" $pkgs
   if pkg_try "$family" $cmd $pkgs; then say "optional tools installed: $pkgs"
   else say "optional tools not installed (banners may not show); to add them: sudo $cmd $pkgs"; fi
 }
@@ -484,7 +500,8 @@ optional_install() {
 pkg_command() {
   case "$1" in
     alpine)  echo "apk add --no-cache" ;;
-    debian)  echo "env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y" ;;
+    # no Recommends: they pulled gcc and image libs, 80 MB unused
+    debian)  echo "env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends" ;;
     fedora)  echo "dnf install -y" ;;
     suse)    echo "zypper --non-interactive install -y" ;;
     arch)    echo "pacman -Sy --noconfirm" ;;
