@@ -300,7 +300,8 @@ usage() {
   cat <<EOF
 guardrail-adm <verb> [args] [--dev]
   install [opts]         one-command install: proxy user, root venv, app copy, CA, trust, units,
-                         rule with failsafe, then verify. opts: --no-model (default installs the ~1 GB model layer) [--model-src=DIR] --persist --failsafe=15m
+                         rule with failsafe, then verify. opts: --no-model (default installs the ~1 GB model layer) [--model-src=DIR] --persist --failsafe=15m --no-enable-units
+                         exit 3 = installed but degraded (model layer missing); 0 only when all that was asked for is in place
                          --arm also diverts traffic now (default: install only, arm later)
                          --dry-run prints the plan for this device and changes nothing
                          run from the project tree this also writes the helper, its sudoers entry
@@ -319,7 +320,7 @@ guardrail-adm <verb> [args] [--dev]
   disarm                 flush the rule, then stop the failsafe timer and the watchdog
   failsafe-test [secs]   prove the dead-man switch fires, then leave the rule off
   units-install          write the systemd units for the installed layout (nothing enabled)
-  units-enable           let those units start at boot (off by default at install)
+  units-enable           let those units start at boot (install does this by default; never the rule)
   units-remove           remove them again
   user-add               create the $PUSER system user
   journal <unit>         last journal lines of one guardrail unit
@@ -917,7 +918,7 @@ seed_endpoints() {
 }
 
 # seconds an address list may age before arm resolves again
-ENDPOINT_MAX_AGE=86400
+ENDPOINT_MAX_AGE=21600
 
 # resolve again when the list is old
 refresh_stale_endpoints() {
@@ -2775,7 +2776,7 @@ dry_run_report() {
   if [ "$enable_units" = 1 ]; then
     say "            will be ENABLED, so it starts by itself on every boot"
   else
-    say "            written but NOT enabled; nothing starts by itself after a boot"
+    say "            written but NOT enabled (--no-enable-units); nothing starts after a boot"
   fi
   if [ "$do_arm" = 1 ]; then
     say "rule       : will be INSTALLED now, port $PORT, failsafe $dur, persist=$([ "$persist" = 1 ] && echo yes || echo no)"
@@ -2804,10 +2805,11 @@ install_payload() {
   build_venv "$with_model"
   # no model degrades the proxy; install goes on
   if [ "$with_model" = 1 ] && [ "${MODEL_DOWNGRADED:-0}" = 1 ]; then
+    MODEL_FAILED=1
     say "WARNING: no model layer (its Python packages have no wheel here); free-form names pass unmasked"
   elif [ "$with_model" = 1 ]; then
     install_model_cold "${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub}" \
-      || say "WARNING: no model layer; free-form names that escape the regex rules pass unmasked"
+      || { MODEL_FAILED=1; say "WARNING: no model layer; free-form names that escape the regex rules pass unmasked"; }
   else
     say "WARNING: model layer NOT installed (--no-model): free-form names pass unmasked"
     say "  regex, checksum and ATR rules still apply; add the model: guardrail-adm install"
@@ -2825,7 +2827,7 @@ install_swap_proxy() {
   esac
 }
 
-# write units or a runner; boot start is never automatic
+# units start at boot unless --no-enable-units
 install_boot_units() {
   local enable_units="$1"
   if [ "$HAS_SYSTEMD" = 1 ]; then
@@ -2839,8 +2841,8 @@ install_boot_units() {
         say "WARNING: could not enable the units; start them by hand after a reboot"
       fi
     else
-      say "units written but not enabled: nothing starts at boot"
-      say "  make them permanent with: sudo $SELF units-enable"
+      say "units written but not enabled (--no-enable-units): nothing starts at boot"
+      say "  enable them with: sudo $SELF units-enable"
     fi
   else
     pin_owner
@@ -2850,7 +2852,7 @@ install_boot_units() {
 }
 
 install_all() {
-  local with_model=1 persist=0 enable_units=0 dry=0 do_arm=0 dur=15m a
+  local with_model=1 persist=0 enable_units=1 dry=0 do_arm=0 dur=15m a
   for a in "$@"; do
     case "$a" in
       --with-model) with_model=1 ;;
@@ -2859,6 +2861,7 @@ install_all() {
       --no-deps) NO_DEPS=1 ;;
       --persist) persist=1 ;;
       --enable-units) enable_units=1 ;;
+      --no-enable-units) enable_units=0 ;;
       --dry-run) dry=1 ;;
       --arm) do_arm=1 ;;
       --failsafe=*) dur="${a#--failsafe=}" ;;
@@ -2919,6 +2922,10 @@ install_all() {
   else
     say "install complete; the rule is not armed (arm it with: sudo $SELF arm)"
     say "check the install read-only: bash $APP/run.sh verify"
+  fi
+  if [ "${MODEL_FAILED:-0}" = 1 ]; then
+    say "install complete but DEGRADED: the model layer is missing (exit 3); retry: sudo $SELF install"
+    exit 3
   fi
 }
 

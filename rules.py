@@ -3625,6 +3625,7 @@ ATR_DIR = Path(os.environ.get("GUARDRAIL_ATR_DIR", BASE / "atr"))
 ATR_CATEGORIES = {
     "prompt-injection", "context-exfiltration", "tool-poisoning",
     "agent-manipulation", "model-abuse", "skill-compromise",
+    "data-poisoning", "excessive-autonomy", "model-security", "privilege-escalation",
 }
 
 # Tool-result rules stay off the user's own words.
@@ -3673,6 +3674,7 @@ def _load_atr() -> None:
     other_conditions = 0
     t0 = time.perf_counter()
     paths = sorted(ATR_DIR.rglob("*.yaml"))
+    overrides = _lane_overrides(ATR_DIR / "lane-overrides.txt")
     loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)   # C parser: 5.5 s down to 0.5 s
     _debug(f"yaml loader: {loader.__name__}" + ("" if hasattr(yaml, "CSafeLoader") else " FALLBACK (fallback, no C extension)"))
     for path in paths:
@@ -3700,7 +3702,7 @@ def _load_atr() -> None:
                 continue
             try:
                 compiled.append((str(cond.get("field") or ATR_CHANNEL_USER),
-                                 re.compile(value)))
+                                 re.compile(value, re.I)))
             except re.error as exc:
                 skipped.append(f"{path.name}: bad regex ({exc})")
         if not compiled:
@@ -3714,7 +3716,8 @@ def _load_atr() -> None:
             "category": category,
             "severity": str(doc.get("severity") or "unknown"),
             "maturity": maturity,
-            "lane": "enforce" if maturity == "stable" else "hunt",
+            "lane": overrides.get(str(doc.get("id") or path.stem),
+                                  "enforce" if maturity == "stable" else "hunt"),
             "patterns": compiled,
         })
     _atr_rules = rules
@@ -3738,6 +3741,20 @@ def _load_atr() -> None:
                                    f"(dropped {len(dropped)}, skipped {len(skipped)})")
         else:
             _atr_stats["error"] = f"no rule files under {ATR_DIR}"
+
+
+def _lane_overrides(path: Path) -> dict[str, str]:
+    """Read +ID / -ID lines into rule id -> lane."""
+    out: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if line[:1] in "+-" and line[1:]:
+            out[line[1:]] = "enforce" if line[0] == "+" else "hunt"
+    return out
 
 
 def atr_start(force: bool = False) -> None:
