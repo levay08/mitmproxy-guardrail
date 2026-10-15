@@ -114,6 +114,9 @@ external_suppress: [ATR-2026-00061, ATR-2026-02818, ATR-2026-00140, ATR-2026-001
 # 00116 fired on "pass secrets to a container" in a devops question (pass 15).
 # 00001, 00213: "Forget what I said earlier", "ignore the previous message"; 0 of 39 attacks move.
 
+# Tool-output enforce rules also read typed text. false turns off.
+atr_user_fallback: true
+
 # The proxy adds its own wrapped note to each request and asks the model to end the reply with the
 # token of the action it took. The person never writes a tag.
 proxy_tag: true

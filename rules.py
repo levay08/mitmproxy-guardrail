@@ -2812,7 +2812,10 @@ def _config_tagging(doc: dict, state: dict) -> None:
 
 def _config_external(doc: dict, state: dict) -> None:
     """Rule ids recorded but never raising the action alone."""
-    global EXTERNAL_SUPPRESS
+    global EXTERNAL_SUPPRESS, ATR_USER_FALLBACK
+    if "atr_user_fallback" in doc:
+        ATR_USER_FALLBACK = bool(doc["atr_user_fallback"])
+    state["atr_user_fallback"] = ATR_USER_FALLBACK
     if "external_suppress" in doc:
         EXTERNAL_SUPPRESS = {str(x).strip() for x in (doc["external_suppress"] or []) if str(x).strip()}
     state["external_suppress"] = sorted(EXTERNAL_SUPPRESS)
@@ -3675,6 +3678,10 @@ CHANNEL_FIELDS: dict[str, set[str]] = {
 
 MAX_MATCH_WINDOW = 80
 
+# Tool-output enforce rules also read typed text.
+# Off: atr_user_fallback.
+ATR_USER_FALLBACK = True
+
 _atr_lock = threading.Lock()
 _started = False
 _atr_attempts = 0
@@ -3683,6 +3690,14 @@ ATR_LAZY = True   # the proxy sets False: a request never loads rules
 _atr_rules: list[dict] = []
 _atr_skipped: list[str] = []
 _atr_stats: dict = {}
+
+
+def _plain_cases(doc: dict) -> bool:
+    """True when half the rule's own cases are prose."""
+    cases = (doc.get("test_cases") or {}).get("true_positives") or []
+    texts = [str(c.get("input") if isinstance(c, dict) else c).lstrip() for c in cases]
+    plain = sum(1 for t in texts if t and t[0] not in "{[<")
+    return bool(texts) and plain * 2 >= len(texts)
 
 
 def _load_atr() -> None:
@@ -3761,6 +3776,8 @@ def _load_atr() -> None:
                                   "enforce" if maturity == "stable" else "hunt"),
             "patterns": compiled,
             "require_all": require_all,
+            "tool_only": {f for f, _ in compiled} == {"tool_response"},
+            "plain_cases": _plain_cases(doc),
         })
     _atr_rules = rules
     _atr_skipped = skipped
@@ -3835,16 +3852,21 @@ def check_atr(text: str, channel: str = ATR_CHANNEL_USER) -> list[dict]:
     if not text:
         return hits
     wanted = CHANNEL_FIELDS.get(channel, {channel})
+    user_side = channel == ATR_CHANNEL_USER and ATR_USER_FALLBACK
     for rule in _atr_rules:
+        reach = wanted
+        if (user_side and rule["lane"] == "enforce" and rule.get("tool_only")
+                and rule.get("plain_cases")):
+            reach = wanted | {"tool_response"}
         if rule.get("require_all"):
             # condition: all means every regex must match this text
-            if not all(f in wanted and p.search(text) for f, p in rule["patterns"]):
+            if not all(f in reach and p.search(text) for f, p in rule["patterns"]):
                 continue
             pairs = rule["patterns"][:1]
         else:
             pairs = rule["patterns"]
         for field, pattern in pairs:
-            if field not in wanted:
+            if field not in reach:
                 continue
             found = _window(text, pattern)
             if found is not None:
