@@ -300,8 +300,8 @@ usage() {
   cat <<EOF
 guardrail-adm <verb> [args] [--dev]
   install [opts]         one-command install: proxy user, root venv, app copy, CA, trust, units,
-                         rule with failsafe, then verify. opts: --no-model (default installs the ~1 GB model layer) [--model-src=DIR] --persist --failsafe=15m --no-enable-units
-                         exit 3 = installed but degraded (model layer missing); 0 only when all that was asked for is in place
+                         rule with failsafe, then verify. opts: --with-model (adds the ~1.4 GB model layer; default is the ~30 MB core) [--model-src=DIR] --persist --failsafe=15m --no-enable-units
+                         exit 3 = installed but degraded (--with-model asked, model layer missing); 0 only when all that was asked for is in place
                          --arm also diverts traffic now (default: install only, arm later)
                          --dry-run prints the plan for this device and changes nothing
                          run from the project tree this also writes the helper, its sudoers entry
@@ -1872,6 +1872,53 @@ e2e_check() {
 }
 
 
+# Dead-man: no listener while rule stands, flush.
+DEADMAN_UNIT=guardrail-deadman
+DEADMAN_EVERY=3
+DEADMAN_MISSES=5
+
+deadman_start() {
+  [ "$HAS_SYSTEMD" = 1 ] || { say "DEADMAN NOT STARTED: no systemd; only the failsafe covers the rule"; return 0; }
+  systemctl reset-failed "$DEADMAN_UNIT.service" >/dev/null 2>&1
+  if systemd-run --quiet --collect --unit="$DEADMAN_UNIT" "$SELF" deadman-run >/dev/null 2>&1; then
+    say "deadman: watching :$PORT every ${DEADMAN_EVERY}s, ${DEADMAN_MISSES} misses flush the rule"
+  else
+    say "DEADMAN NOT STARTED: the rule is covered by the watchdog and failsafe only"
+  fi
+  return 0
+}
+
+deadman_stop() {
+  [ "$HAS_SYSTEMD" = 1 ] && [ -z "${DEADMAN_SELF:-}" ] || return 0
+  systemctl stop "$DEADMAN_UNIT.service" >/dev/null 2>&1
+  return 0
+}
+
+deadman_run() {
+  local misses=0 rp l
+  export DEADMAN_SELF=1
+  say "deadman started pid $$"
+  while :; do
+    rp=0; rule_present || rp=$?
+    if [ "$rp" = 1 ]; then say "deadman: no rule stands, nothing to guard; exiting"; return 0; fi
+    l="$(proxy_listeners)"
+    if [ "${l%%:*}" -ge 1 ]; then
+      [ "$misses" -gt 0 ] && say "deadman: listener back after $misses miss(es)"
+      misses=0
+    else
+      misses=$((misses + 1))
+      say "deadman: miss $misses of $DEADMAN_MISSES, no listener on 127.0.0.1:$PORT"
+      if [ "$misses" -ge "$DEADMAN_MISSES" ]; then
+        say "DEADMAN FIRED: no listener for $((misses * DEADMAN_EVERY))s with the rule standing; releasing it"
+        disarm
+        say "deadman: release done, rule present rc $(rule_present; echo $?)"
+        return 0
+      fi
+    fi
+    sleep "$DEADMAN_EVERY"
+  done
+}
+
 # Owner-run watchdog: arm starts it, disarm stops it.
 watchdog_start() {
   local wd="$RUN_APP/watchdog.py" out rc
@@ -1964,6 +2011,7 @@ arm() {
   ARM_OK=1
   trap - EXIT
   # only an armed rule that passed e2e is worth watching
+  deadman_start
   watchdog_start
 }
 
@@ -2166,7 +2214,7 @@ disarm() {
     else say "quic chain could NOT be flushed"; rc=1; fi
   fi
   # cancel the failsafe only once the rules are gone
-  if [ "$rc" = 0 ]; then failsafe_cancel; watchdog_stop
+  if [ "$rc" = 0 ]; then failsafe_cancel; watchdog_stop; deadman_stop
   else say "the rule may still stand, so the failsafe stays armed"; fi
   # reset desktop PAC: stale one broke browsers, 1 Oct 2026
   desktop_proxy_off
@@ -2785,7 +2833,8 @@ dry_run_report() {
     say "rule       : NOT installed (default); your traffic is not diverted until you run arm"
   fi
   say "CA         : $([ -f "$USER_HOME/.mitmproxy/mitmproxy-ca.pem" ] && echo "copied from $USER_HOME/.mitmproxy" || echo "created new by mitmdump in $CONFDIR")"
-  [ "$with_model" = 1 ] || say "model      : NOT installed (--no-model); free-form names pass unmasked"
+  [ "$with_model" = 1 ] || say "model      : NOT installed (core is the default); add it with --with-model"
+  print_bill "$with_model"
   [ "$with_model" = 1 ] && say "option     : the language-model layer is installed too; weights come from ${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub}, or are downloaded at their pinned commit, into $HFDIR if they match their pinned sha256"
   say ""
   say "after the real install, run:"
@@ -2795,9 +2844,20 @@ dry_run_report() {
 }
 
 
+# sizes measured 2026-10-15: audit/install-default-20261015/sizes.json
+print_bill() {
+  if [ "$1" = 1 ]; then
+    say "download   : about 1.4 GB: core 30 MB, model wheels 250 MB (CPU torch, no CUDA), weights 1.16 GB"
+    say "             the weights are skipped when already under ${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub}"
+  else
+    say "download   : about 30 MB (proxy core, no model layer); add the model later with: install --with-model"
+  fi
+}
+
 # payload: dirs, app copy, plan, venv, CA, trust
 install_payload() {
   local with_model="$1"
+  print_bill "$with_model"
   make_dirs
   logrotate_install
   copy_app
@@ -2811,8 +2871,8 @@ install_payload() {
     install_model_cold "${MODEL_SRC:-$USER_HOME/.cache/huggingface/hub}" \
       || { MODEL_FAILED=1; say "WARNING: no model layer; free-form names that escape the regex rules pass unmasked"; }
   else
-    say "WARNING: model layer NOT installed (--no-model): free-form names pass unmasked"
-    say "  regex, checksum and ATR rules still apply; add the model: guardrail-adm install"
+    say "note: core install; the model layer is not installed, so free-form names pass unmasked"
+    say "  regex, checksum and ATR rules still apply; add the model: guardrail-adm install --with-model"
   fi
   install_ca
   install_trust
@@ -2852,11 +2912,11 @@ install_boot_units() {
 }
 
 install_all() {
-  local with_model=1 persist=0 enable_units=1 dry=0 do_arm=0 dur=15m a
+  local with_model=0 persist=0 enable_units=1 dry=0 do_arm=0 dur=15m a
   for a in "$@"; do
     case "$a" in
       --with-model) with_model=1 ;;
-      --no-model) with_model=0 ;;
+      --no-model) with_model=0 ;; # no-op alias, core is the default
       --model-src=*) MODEL_SRC="${a#--model-src=}" ;;
       --no-deps) NO_DEPS=1 ;;
       --persist) persist=1 ;;
@@ -2968,7 +3028,7 @@ verify() {
         ok "model weights match their pinned checksums: $(describe "$HFDIR")"
         model_load_check
       else bad "model layer: $BAD"; fi
-    else note "model layer NOT installed: free-form names pass unmasked (regex and ATR rules still apply); install without --no-model"; fi
+    else note "model layer NOT installed: free-form names pass unmasked (regex and ATR rules still apply); install with --with-model"; fi
   fi
   for p in "$LIBDIR" "$VENV" "$IAPP" "$RUNNER" "$CA_PUB"; do
     # the venv lives inside LIBDIR and always holds links
@@ -3240,6 +3300,7 @@ case "${1:-}" in
   arm) arm "${2:-15m}" ;;
   disarm) disarm ;;
   failsafe-fire) failsafe_fire ;;
+  deadman-run) deadman_run ;;
   failsafe-test) failsafe_test "${2:-20}" ;;
   units-install) units_install ;;
   units-enable) units_enable ;;
