@@ -1322,6 +1322,183 @@ def _rule_classification(joined: str, turn: dict) -> tuple:
     return hits, keras, downgraded, lunak, history_warnings
 
 
+def _scan_strings(text: str) -> dict:
+    """Map each string value's path to its raw content span."""
+    spans: dict = {}
+    size = len(text)
+
+    def skip_ws(i: int) -> int:
+        while i < size and text[i] in " \t\r\n":
+            i += 1
+        return i
+
+    def string_end(i: int) -> int:
+        j = i + 1
+        while text[j] != '"':
+            j += 2 if text[j] == "\\" else 1
+        return j + 1
+
+    def value(i: int, path: tuple) -> int:
+        i = skip_ws(i)
+        char = text[i]
+        if char == '"':
+            end = string_end(i)
+            # a repeated path is ambiguous: mark it, never edit it
+            spans[path] = None if path in spans else (i + 1, end - 1)
+            return end
+        if char in "{[":
+            close = "}" if char == "{" else "]"
+            i = skip_ws(i + 1)
+            if text[i] == close:
+                return i + 1
+            index = 0
+            while True:
+                key: object = index
+                if char == "{":
+                    end = string_end(skip_ws(i))
+                    key = json.loads(text[skip_ws(i):end])
+                    i = skip_ws(end) + 1
+                i = skip_ws(value(i, path + (key,)))
+                index += 1
+                if text[i] == ",":
+                    i += 1
+                    continue
+                return i + 1
+        while i < size and text[i] not in ",]} \t\r\n":
+            i += 1
+        return i
+
+    value(0, ())
+    return spans
+
+
+def _decode_offsets(raw: str) -> tuple[str, list[int]]:
+    """Decode a JSON string body, with raw offsets per char."""
+    out: list[str] = []
+    offs: list[int] = []
+    i, size = 0, len(raw)
+    simple = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+    while i < size:
+        offs.append(i)
+        if raw[i] != "\\":
+            out.append(raw[i])
+            i += 1
+        elif raw[i + 1] in simple:
+            out.append(simple[raw[i + 1]])
+            i += 2
+        else:
+            code = int(raw[i + 2:i + 6], 16)
+            i += 6
+            if 0xD800 <= code < 0xDC00 and raw[i:i + 2] == "\\u":
+                low = int(raw[i + 2:i + 6], 16)
+                if 0xDC00 <= low < 0xE000:
+                    code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                    i += 6
+            out.append(chr(code))
+    offs.append(size)
+    return "".join(out), offs
+
+
+def _string_edits(old: str, new: str) -> list[tuple[int, int, str]]:
+    """Minimal (start, end, text) edits turning old into new."""
+    import difflib
+    a, b = old.splitlines(True), new.splitlines(True)
+    edits: list[tuple[int, int, str]] = []
+    starts = [0]
+    for line in a:
+        starts.append(starts[-1] + len(line))
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        x, y = "".join(a[i1:i2]), "".join(b[j1:j2])
+        head = 0
+        while head < min(len(x), len(y)) and x[head] == y[head]:
+            head += 1
+        tail = 0
+        while tail < min(len(x), len(y)) - head and x[-1 - tail] == y[-1 - tail]:
+            tail += 1
+        edits.append((starts[i1] + head, starts[i1] + len(x) - tail, y[head:len(y) - tail]))
+    return edits
+
+
+def _changed_leaves(old, new, path: tuple, found: list, bad: list) -> None:
+    """Collect string leaves that differ; structure drift goes to bad."""
+    if isinstance(old, str) and isinstance(new, str):
+        if old != new:
+            found.append((path, old, new))
+    elif isinstance(old, dict) and isinstance(new, dict) and list(old) == list(new):
+        for key in old:
+            _changed_leaves(old[key], new[key], path + (key,), found, bad)
+    elif isinstance(old, list) and isinstance(new, list) and len(old) == len(new):
+        for index, (x, y) in enumerate(zip(old, new)):
+            _changed_leaves(x, y, path + (index,), found, bad)
+    elif old != new:
+        bad.append(path)
+
+
+def _static_prefix(path: tuple, orig) -> bool:
+    """True for tools and system blocks in the global prefix."""
+    if not isinstance(orig, dict) or not path:
+        return False
+    last = -1
+    system = orig.get("system")
+    if isinstance(system, list):
+        for index, block in enumerate(system):
+            cache = block.get("cache_control") if isinstance(block, dict) else None
+            if isinstance(cache, dict) and cache.get("scope") == "global":
+                last = index
+    tools = orig.get("tools")
+    tool_global = isinstance(tools, list) and any(
+        isinstance(t, dict) and isinstance(t.get("cache_control"), dict)
+        and t["cache_control"].get("scope") == "global" for t in tools)
+    if path[0] == "tools":
+        return tool_global or last >= 0
+    return path[0] == "system" and len(path) > 1 and isinstance(path[1], int) and path[1] <= last
+
+
+def splice_envelope(raw: str, orig, new) -> tuple[str, list]:
+    """Rewrite only changed string spans inside the original bytes."""
+    found: list = []
+    skipped: list = []
+    _changed_leaves(orig, new, (), found, skipped)
+    if not found:
+        return raw, skipped
+    try:
+        spans = _scan_strings(raw)
+    except (IndexError, ValueError):
+        return raw, skipped + [p for p, _, _ in found]
+    cuts: list[tuple[int, int, str]] = []
+    for path, old, replacement in found:
+        span = spans.get(path)
+        if span is None or _static_prefix(path, orig):
+            skipped.append(path)
+            continue
+        decoded, offs = _decode_offsets(raw[span[0]:span[1]])
+        if decoded != old:
+            skipped.append(path)
+            continue
+        for start, end, text in _string_edits(old, replacement):
+            safe = any(0xD800 <= ord(c) < 0xE000 for c in text)
+            cuts.append((span[0] + offs[start], span[0] + offs[end],
+                         json.dumps(text, ensure_ascii=safe)[1:-1]))
+    for start, end, text in sorted(cuts, reverse=True):
+        raw = raw[:start] + text + raw[end:]
+    return raw, skipped
+
+
+def _envelope_text(flow, body) -> str:
+    """Serialise body into the bytes that arrived, edited in place."""
+    raw = flow.metadata.get("guardrail_raw_json")
+    if not isinstance(raw, str):
+        return json.dumps(body, ensure_ascii=False)
+    try:
+        text, skipped = splice_envelope(raw, json.loads(raw), body)
+    except (ValueError, RecursionError, TypeError):
+        return json.dumps(body, ensure_ascii=False)
+    flow.metadata["guardrail_envelope_skipped"] = len(skipped)
+    return text
+
+
 def _body_text(flow, body) -> str:
     """The payload as it arrived: JSON or form."""
     from urllib.parse import urlencode
@@ -1330,7 +1507,7 @@ def _body_text(flow, body) -> str:
         key, pairs = form_prompt
         content = body["messages"][0]["content"]
         return urlencode([(k, content if k == key else v) for k, v in pairs])
-    text = json.dumps(body, ensure_ascii=False)
+    text = _envelope_text(flow, body)
     form_field = flow.metadata.get("guardrail_form_field")
     if form_field:
         return urlencode([(form_field, text)] + list(flow.metadata.get("guardrail_form_rest") or []))
@@ -1766,6 +1943,7 @@ class Guardrail:
             self._audit_unparsed(flow, host, "not-json")
             return None
         flow.metadata["guardrail_t0"] = time.monotonic()
+        flow.metadata["guardrail_raw_json"] = raw
         try:
             payload = json.loads(raw)
         except RecursionError:
@@ -2057,6 +2235,8 @@ class Guardrail:
             chars_out=len(flow.request.get_text(strict=False) or ""),
         )
         record["user_scope"] = scope
+        if flow.metadata.get("guardrail_envelope_skipped"):
+            record["envelope_skipped"] = flow.metadata["guardrail_envelope_skipped"]
         return _record_extras(record, state, tag, tag_sent, warn_rules, kinds, mapping)
 
     def _finish_record(self, flow: http.HTTPFlow, host: str, request_id: str,
