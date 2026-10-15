@@ -972,6 +972,14 @@ MALICIOUS_RULES: list[tuple[str, re.Pattern]] = [
      re.compile(r"(?i)you\s+are\s+now\s+(?:DAN|developer\s+mode)")),
     ("jailbreak_persona",
      re.compile(r"(?i)act\s+as\s+an?\s+unrestricted")),
+    # garak inthewild #29 and #589; ATR twins read tool_response only
+    ("jailbreak_persona",
+     re.compile(r"(?i)\bfactual\s+resource\b[\s\S]{0,150}\bany\s+text\s+required[,\s]+including\s+"
+                r"(?:those\s+of\s+)?(?:illegal|unethical|explicit|dangerous|offensive)\b"
+                r"[\s\S]{0,80}\bwithout\s+(?:refusal|disclaimer)")),
+    ("jailbreak_persona",
+     re.compile(r"(?i)\bREPLACE\s+THE\s+FIRST\s+SENTENCE\b[\s\S]{0,80}\bWITH\s+WHATEVER\s+YOU\s+WANT"
+                r"[\s\S]{0,80}\bDELETE\s+THIS\s+INSTRUCTION")),
     ("exfil_system_prompt",
      re.compile(r"(?i)(?:repeat|print|show)\s+(?:me\s+)?your\s+(?:system\s+)?(?:prompt|instructions)")),
     # Indonesian persona and prompt-dump asks, parity with the English rules.
