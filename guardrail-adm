@@ -97,6 +97,7 @@ else RUN_APP="$IAPP"; MITMDUMP="$VENV/bin/mitmdump"
 fi
 
 NO_DEPS=0
+BANNERS="${GUARDRAIL_BANNERS:-0}"
 MODEL_SRC=""
 
 need_owner() { [ -n "$OWNER" ] && [ "$UID_TARGET" != 0 ] || die "owner unknown: call through sudo, or pin OWNER_UID in $CONF"; }
@@ -300,7 +301,7 @@ usage() {
   cat <<EOF
 guardrail-adm <verb> [args] [--dev]
   install [opts]         one-command install: proxy user, root venv, app copy, CA, trust, units,
-                         rule with failsafe, then verify. opts: --with-model (adds the ~1.4 GB model layer; default is the ~30 MB core) [--model-src=DIR] --persist --failsafe=15m --no-enable-units
+                         rule with failsafe, then verify. opts: --with-model (adds the ~1.4 GB model layer; default is the ~30 MB core) [--model-src=DIR] --with-banners (adds the libnotify desktop banner tool, about 15 MB on apt hosts) --persist --failsafe=15m --no-enable-units
                          exit 3 = installed but degraded (--with-model asked, model layer missing); 0 only when all that was asked for is in place
                          --arm also diverts traffic now (default: install only, arm later)
                          --dry-run prints the plan for this device and changes nothing
@@ -411,7 +412,7 @@ requirements_report() {
   opt="$(requirements_missing optional)"
   if [ -n "$opt" ]; then
     cmd="$(pkg_command "$(host_family)")"
-    say "optional tool missing: $(printf '%s' "$opt" | awk '{print $1}' | tr '\n' ' ')- desktop banners will not show${cmd:+; install: sudo $cmd $(printf '%s' "$opt" | awk '{print $2}' | tr '\n' ' ')}"
+    say "optional tool missing: $(printf '%s' "$opt" | awk '{print $1}' | tr '\n' ' ')- desktop banners will not show; add them with: sudo bash $APP/guardrail-adm install --with-banners${cmd:+ (or: sudo $cmd $(printf '%s' "$opt" | awk '{print $2}' | tr '\n' ' '))}"
   fi
   if [ -z "$missing" ]; then
     say "prerequisites complete on $(host_family)"
@@ -2305,7 +2306,7 @@ install_deps() {
     return 0
   fi
   if requirements_report; then
-    [ "$NO_DEPS" = 1 ] || optional_install
+    [ "$NO_DEPS" = 1 ] || [ "$BANNERS" != 1 ] || optional_install
     return 0
   fi
   if [ "$NO_DEPS" = 1 ]; then
@@ -2313,7 +2314,7 @@ install_deps() {
     return 0
   fi
   requirements_install || return 1
-  optional_install
+  [ "$BANNERS" != 1 ] || optional_install
   # installed but still absent: say so, do not continue
   if ! requirements_report; then
     say "prerequisites are still missing after installing; fix them, then run install again"
@@ -2881,6 +2882,11 @@ print_bill() {
   else
     say "download   : about 30 MB (proxy core, no model layer); add the model later with: install --with-model"
   fi
+  if [ "$BANNERS" = 1 ]; then
+    say "banners    : libnotify tool included (about 15 MB more on apt hosts, sized before the download)"
+  else
+    say "banners    : NOT installed (saves about 15 MB on apt hosts); add them with: install --with-banners"
+  fi
 }
 
 # payload: dirs, app copy, plan, venv, CA, trust
@@ -2948,6 +2954,7 @@ install_all() {
       --no-model) with_model=0 ;; # no-op alias, core is the default
       --model-src=*) MODEL_SRC="${a#--model-src=}" ;;
       --no-deps) NO_DEPS=1 ;;
+      --with-banners) BANNERS=1 ;;
       --persist) persist=1 ;;
       --enable-units) enable_units=1 ;;
       --no-enable-units) enable_units=0 ;;
