@@ -1647,6 +1647,13 @@ desktop_proxy_off() {
   esac
 }
 
+# say who still holds the port after a stop
+proxy_left_report() {
+  proxy_up || return 0
+  say "WARNING: port $PORT is still held by: $(listener_users)"
+  say "  not stopped here: not $PUSER's mitmdump; find it with: ss -ltnp 'sport = :$PORT'"
+}
+
 proxy_stop() {
   local pids
   # a standing redirect would hit a dead port
@@ -1665,15 +1672,18 @@ proxy_stop() {
     rm -f "$PIDFILE"
     desktop_proxy_off
     say "no proxy running"
+    proxy_left_report
     return 0
   fi
   # kill only $PUSER's processes; never a recycled pid
   local keep="" p
   for p in $pids; do
-    if [ -d "/proc/$p" ] && [ "$(stat -c %U "/proc/$p" 2>/dev/null)" = "$PUSER" ]; then
+    if [ ! -d "/proc/$p" ]; then
+      continue
+    elif [ "$(stat -c %U "/proc/$p" 2>/dev/null)" = "$PUSER" ]; then
       keep="$keep $p"
     else
-      say "not touching pid $p: it is not $PUSER's process"
+      say "not touching pid $p: owned by $(stat -c %U "/proc/$p" 2>/dev/null), not $PUSER"
     fi
   done
   pids="${keep# }"
@@ -1681,6 +1691,7 @@ proxy_stop() {
     rm -f "$PIDFILE"
     desktop_proxy_off
     say "no running process of $PUSER to stop"
+    proxy_left_report
     return 0
   fi
   kill $pids 2>/dev/null
@@ -1689,6 +1700,7 @@ proxy_stop() {
   rm -f "$PIDFILE"
   desktop_proxy_off
   say "proxy stopped: $pids"
+  proxy_left_report
 }
 
 status() {
