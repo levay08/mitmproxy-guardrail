@@ -40,6 +40,20 @@ providers:
   - \.openai\.azure\.com
   - dashscope\.aliyuncs\.com
   - api\.moonshot\.cn
+  - chat\.z\.ai
+  - api\.x\.ai
+  - huggingface\.co
+  - ollama\.com
+  - api2?\.cursor\.sh
+  - \.codeium\.com
+  - bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com
+  - api\.replicate\.com
+  - api\.fireworks\.ai
+  - open\.bigmodel\.cn
+  - aip\.baidubce\.com
+  - 127\.0\.0\.1(:9999|:1143[45])?      # the local mock provider used by the tests
+  - test\.example\.com  # found in use
+  - api\.snapcraft\.io  # found in use
 notify_in_reply: true
 
 # DLP data: rule corpora, name lists, validators. false = off.

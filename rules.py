@@ -879,8 +879,8 @@ GROUP_RULES: list[tuple[str, re.Pattern]] = [
     ("RAHASIA_KONTEKS", re.compile(r"(?i)\b(?:aws\s*(?:key|secret)|api\s*key|secret\s*(?:key|token)?|"
                                    r"access\s*key|private\s*key|token)\b[^\n]{0,20}?"
                                    r"(?<![A-Za-z0-9!@#$%^&*_\-=+])"
-                                   r"((?=[A-Za-z0-9!@#$%^&*_\-=+]*\d)(?=[A-Za-z0-9!@#$%^&*_\-=+]*[A-Za-z])"
-                                   r"[A-Za-z0-9!@#$%^&*_\-=+]{16,64})\b")),
+                                   r"((?=[A-Za-z0-9!@#$%^&*_\-=+/.~]*\d)(?=[A-Za-z0-9!@#$%^&*_\-=+/.~]*[A-Za-z])"
+                                   r"[A-Za-z0-9!@#$%^&*_\-=+/.~]{16,64})\b")),
 ]
 
 # Card number; a Luhn check keeps ordinary digit runs out.
@@ -1966,7 +1966,7 @@ AI_APPS: list[dict] = [
                r"statsig\.anthropic\.com"],
      "agents": ("claude-cli", "claude-code", "x-claude-code-session-id")},
     {"app": "Hermes", "bin": "hermes", "dirs": (".hermes",),
-     "hosts": [r"ai\.paas\.id", r"openrouter\.ai", r"api\.openai\.com"],
+     "hosts": [r"openrouter\.ai", r"api\.openai\.com"],
      "agents": ("hermes", "ai-sdk", "openai-python")},
     {"app": "Codex CLI", "bin": "codex", "dirs": (".codex",),
      "hosts": [r"api\.openai\.com", r"chatgpt\.com"],
