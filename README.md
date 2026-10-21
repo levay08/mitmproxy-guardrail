@@ -91,3 +91,12 @@ A language model is not a safeguard: this guardrail works on data and patterns, 
 ## Reboot
 
 Coming back after a reboot is proven in a guest only. It was not run on a host, so do not rely on it.
+
+## Tested on
+
+- openSUSE Tumbleweed, GNOME, x86_64 - the author's machine: install, arm, verify, audit.
+- Debian-family guest (blankon image), clean machine: clone from the repository, install, arm,
+  one provider request returns 200 while armed, disarm leaves the request working. Recorded in
+  `qaladder-gates/g4.txt` of the research tree, not shipped here.
+- Fedora, Arch and Alpine branches exist in the installer (package names, trust store, NSS) but have
+  not been run yet. Their code paths are the same; treat those families as untested, not as broken.
