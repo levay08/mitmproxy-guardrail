@@ -6,8 +6,9 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin
 # --dev needed: sudo drops GR_DEV; mode is unsafe
 DEV=0
 LONG=0
+NO_REARM=0
 ARGS=()
-for a in "$@"; do case "$a" in --dev) DEV=1 ;; --long) LONG=1 ;; *) ARGS+=("$a") ;; esac; done
+for a in "$@"; do case "$a" in --dev) DEV=1 ;; --long) LONG=1 ;; --no-rearm) NO_REARM=1 ;; *) ARGS+=("$a") ;; esac; done
 [ "${GR_DEV:-0}" = 1 ] && DEV=1
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 
@@ -21,6 +22,8 @@ REGULAR_PORT="${GUARDRAIL_REGULAR_PORT:-8898}"
 LOG=/var/log/guardrail-adm.log
 PIDFILE=/run/guardrail-proxy.pid
 FSPID=/run/guardrail-failsafe.pid
+REARM=/run/guardrail-rearm
+EXPIRY=/run/guardrail-expiry
 LIST=/run/guardrail-ai4.list
 LIST6=/run/guardrail-ai6.list
 LISTNAT=/run/guardrail-nat64.list
@@ -58,6 +61,14 @@ log() {
 say() { printf '%s\n' "$*"; log "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; log "error: $*"; exit 1; }
 
+# Append one audit line to the existing file.
+audit_event() {
+  local f="$LOGDIR/audit.jsonl"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  printf '{"ts": "%s", "action": "%s", "host": "-", "findings": [], "reason": "%s"}\n' \
+    "$(date -Is)" "$1" "$2" >>"$f"
+}
+
 # One key from a root-owned file nobody else can write.
 root_file_get() {
   local f="$1" k="$2"
@@ -73,6 +84,14 @@ UID_TARGET=""
 case "${SUDO_UID:-}" in ''|0|*[!0-9]*) ;; *) UID_TARGET="$SUDO_UID" ;; esac
 [ -n "$UID_TARGET" ] || UID_TARGET="$(conf_get OWNER_UID)"
 [ -n "$UID_TARGET" ] || { [ "$(id -u)" -ne 0 ] && UID_TARGET="$(id -u)"; }
+OWNER_HINT="call through sudo, or pin OWNER_UID in $CONF"
+# root login: single human user, when no sudo hint
+if [ -z "$UID_TARGET" ] && [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ]; then
+  humans="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ {print $1":"$3}')"
+  if [ "$(printf '%s\n' "$humans" | grep -c .)" = 1 ]; then UID_TARGET="${humans#*:}"
+  else OWNER_HINT="root login with $(printf '%s\n' "$humans" | grep -c .) human users; log in as the owner and run: sudo bash $0 ${1:-install}"
+  fi
+fi
 OWNER=""; USER_HOME=""; OWNER_GROUP=""
 if [ -n "$UID_TARGET" ]; then
   OWNER="$(getent passwd "$UID_TARGET" | cut -d: -f1)"
@@ -100,7 +119,7 @@ NO_DEPS=0
 BANNERS="${GUARDRAIL_BANNERS:-0}"
 MODEL_SRC=""
 
-need_owner() { [ -n "$OWNER" ] && [ "$UID_TARGET" != 0 ] || die "owner unknown: call through sudo, or pin OWNER_UID in $CONF"; }
+need_owner() { [ -n "$OWNER" ] && [ "$UID_TARGET" != 0 ] || die "owner unknown: $OWNER_HINT"; }
 need_app() { need_owner; [ -n "$APP" ] && [ -f "$APP/guardrail.py" ] || die "app $APP_NOTE"; }
 need_nft() { [ -n "$NFT" ] || die "nft not found: install nftables"; }
 need_systemd() { [ "$HAS_SYSTEMD" = 1 ] || die "this verb needs systemd, which is not running here; nothing was changed"; }
@@ -327,6 +346,7 @@ guardrail-adm <verb> [args] [--dev]
   journal <unit>         last journal lines of one guardrail unit
   seal-logs              chmod 0600 the proxy logs that hold request headers
   purge-logs             delete the proxy logs left in /tmp by earlier runs
+  exempt list|add F|remove F  hosts the proxy never inspects; F is a file, one host per line
   revoke                 remove the sudoers entry and this helper, ending root access
   rollback               put the previous app copy back and drop the rule; uninstall (log kept) when none
   ca-status              where the CA is and which stores trust it (read-only)
@@ -455,7 +475,7 @@ requirements_install() {
   return 0
 }
 
-# Size of an apt install, printed before apt runs: a forecast.
+# Size of an apt install, printed as a forecast.
 pkg_forecast() {
   local family="$1" label="$2" out; shift 2
   if [ "$family" != debian ]; then
@@ -501,7 +521,7 @@ optional_install() {
 pkg_command() {
   case "$1" in
     alpine)  echo "apk add --no-cache" ;;
-    # no Recommends: they pulled gcc and image libs, 80 MB unused
+    # no Recommends: they pulled gcc and image libs too
     debian)  echo "env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends" ;;
     fedora)  echo "dnf install -y" ;;
     suse)    echo "zypper --non-interactive install -y" ;;
@@ -612,6 +632,7 @@ OWNER ALL=(root) NOPASSWD: /usr/local/sbin/guardrail-adm status, \
     /usr/local/sbin/guardrail-adm failsafe-test, \
     /usr/local/sbin/guardrail-adm set-sync, \
     /usr/local/sbin/guardrail-adm endpoints, \
+    /usr/local/sbin/guardrail-adm exempt list, \
     /usr/local/sbin/guardrail-adm mode neutral, \
     /usr/local/sbin/guardrail-adm mode persistent, \
     /usr/local/sbin/guardrail-adm purge-logs
@@ -1251,6 +1272,7 @@ arm_failsafe() {
   case "$dur" in *[!0-9a-z]*) die "bad duration: $dur" ;; esac
   case "$dur" in [0-9]*) ;; *) die "bad duration: $dur" ;; esac
   secs="$(to_seconds "$dur")" || die "bad duration: $dur"
+  printf '%s\n' "$(( $(date +%s) + secs ))" >"$EXPIRY"
   case "$(failsafe_method)" in
     systemd) ;;
     background)
@@ -1299,8 +1321,47 @@ failsafe_fire() {
   done
   if [ "$n" -gt 0 ]; then say "failsafe fired: $n chain(s) flushed (divert, quic)"
   else say "failsafe fired: no chain to flush"; fi
-  rm -f "$FSPID"
+  rm -f "$FSPID" "$EXPIRY"
   [ "$HAS_SYSTEMD" = 1 ] && systemctl stop "$UNIT.timer" >/dev/null 2>&1
+  if [ "$n" -gt 0 ]; then
+    audit_event PROTECTION-ENDED "failsafe window expired, rule flushed"
+    rearm_spawn
+  fi
+  return 0
+}
+
+# Detached: arm stops the calling failsafe service.
+rearm_spawn() {
+  [ -s "$REARM" ] || { say "no re-arm: not enabled for this arm"; return 0; }
+  if [ "$HAS_SYSTEMD" = 1 ]; then
+    systemctl reset-failed guardrail-rearm.service >/dev/null 2>&1
+    systemd-run --quiet --collect --unit=guardrail-rearm "$SELF" rearm-run >/dev/null 2>&1 \
+      || say "re-arm could not be started; protection stays off"
+  else
+    setsid nohup "$SELF" rearm-run >/dev/null 2>&1 </dev/null &
+  fi
+  return 0
+}
+
+# Re-arm only if proxy is alive.
+rearm_run() {
+  local secs
+  secs="$(head -1 "$REARM" 2>/dev/null)"
+  case "$secs" in ''|*[!0-9]*) say "re-arm: no valid window"; return 0 ;; esac
+  sleep 2
+  if ! redirect_target_ok >/dev/null; then
+    rm -f "$REARM"
+    audit_event PROTECTION-OFF "proxy is not listening, rule left off"
+    say "re-arm skipped: proxy is not listening; rule stays off"
+    return 0
+  fi
+  if "$SELF" arm "${secs}s"; then
+    audit_event PROTECTION-REARMED "window renewed for ${secs}s after end-to-end test"
+  else
+    rm -f "$REARM"
+    audit_event PROTECTION-OFF "re-arm failed its checks, rule left off"
+    say "re-arm failed; rule stays off and re-arming stops"
+  fi
   return 0
 }
 
@@ -1722,6 +1783,12 @@ status() {
     1) say "   not diverting: no complete redirect for uid $UID_TARGET to :$PORT" ;;
     *) say "   UNKNOWN: nft could not be read, so no claim is made either way" ;;
   esac
+  say "== protection window"
+  rp=0; rule_present || rp=$?
+  if [ "$rp" = 0 ] && [ -s "$EXPIRY" ]; then
+    say "   armed, $(( $(head -1 "$EXPIRY") - $(date +%s) ))s left, re-arm $([ -s "$REARM" ] && echo on || echo off)"
+  elif [ "$rp" = 0 ]; then say "   armed, no window recorded"
+  else say "   unarmed"; fi
   say "== failsafe ($(failsafe_method))"
   if [ "$HAS_SYSTEMD" = 1 ]; then
     systemctl list-timers --all 'guardrail*' --no-pager 2>&1 | sed -n '1,3p'
@@ -1755,6 +1822,7 @@ failsafe_test() {
   [ "$secs" -ge 5 ] && [ "$secs" -le 120 ] || die "seconds must be 5 to 120: $secs"
   proxy_up || die "REFUSED: nothing listens on port $PORT; start the proxy first: sudo $SELF proxy-start"
   redirect_target_ok || die "failsafe-test refused: no rule was installed"
+  rm -f "$REARM"
   set_sync
   # failsafe first: if it fails, no rule is installed
   arm_failsafe "${secs}s"
@@ -1806,7 +1874,40 @@ e2e_candidates() {
       printf '%s\n' "https://$host/v1/chat/completions" "https://$host/v1/messages"
     fi
   fi
+  e2e_shipped
   echo "https://api.openai.com/v1/models"
+}
+
+# shipped providers that resolve, at most three
+e2e_shipped() {
+  local y="" f h
+  for f in "$RUN_APP/guardrail.yaml" "$APP/guardrail.yaml"; do
+    [ -r "$f" ] && { y="$f"; break; }
+  done
+  [ -n "$y" ] || return 0
+  sed -n '/^providers:/,/^[a-z_]*:/s/^  - \(.*\)$/\1/p' "$y" | grep -E '^[a-zA-Z0-9.\\-]+$' | tr -d '\\' \
+    | while IFS= read -r h; do
+        getent hosts "$h" >/dev/null 2>&1 && echo "https://$h/"
+      done | head -3
+}
+
+# exempt hosts last; only others show inspection
+e2e_order() {
+  local url h ex; ex="$(exempt_hosts_read)"
+  local -a late=()
+  while IFS= read -r url; do
+    h="${url#https://}"; h="${h%%/*}"
+    if [ -n "$ex" ] && printf '%s\n' "$ex" | grep -qxF "$h"; then late+=("$url"); else echo "$url"; fi
+  done
+  [ "${#late[@]}" -eq 0 ] || printf '%s\n' "${late[@]}"
+}
+
+# EXEMPT line proves the proxy path only
+e2e_exempt_seen() {
+  local url="$1" af="$2" n="$3" h
+  h="${url#https://}"; h="${h%%/*}"
+  [ "$n" -gt 0 ] || return 1
+  tail -n "$n" "$af" 2>/dev/null | grep -F '"action": "EXEMPT"' | grep -qF "\"host\": \"$h\""
 }
 
 # one audit record in; prints ready, failed or unknown
@@ -1855,6 +1956,10 @@ e2e_probe_one() {
       return 0
     fi
   fi
+  if e2e_exempt_seen "$url" "$af" "$((after - before))"; then
+    say "end-to-end check: $url is exempt; the proxy recorded EXEMPT, so the path works (inspection not exercised)"
+    return 0
+  fi
   say "note: $url answered (code $code) but our probe was not recorded"
   return 2
 }
@@ -1871,7 +1976,7 @@ e2e_check() {
   # 1 Oct audit: $STATE/history.log empty, owner host never used
   hist="$STATE/data/history.log"
   local -a urls=()
-  while IFS= read -r url; do urls+=("$url"); done < <(e2e_candidates "$hist")
+  while IFS= read -r url; do urls+=("$url"); done < <(e2e_candidates "$hist" | e2e_order)
   text="guardrail arm check $$-$(date +%s)"
   sha="$(printf '%s' "$text" | sha256sum | cut -c1-12)"
   probe="{\"messages\":[{\"role\":\"user\",\"content\":\"$text\"}]}"
@@ -2040,6 +2145,8 @@ arm() {
   fi
   ARM_OK=1
   trap - EXIT
+  if [ "$NO_REARM" = 1 ]; then rm -f "$REARM"
+  else to_seconds "${1:-15m}" >"$REARM"; fi
   # only an armed rule that passed e2e is worth watching
   deadman_start
   watchdog_start
@@ -2127,7 +2234,7 @@ OnUnitActiveSec=5min
 [Install]
 WantedBy=timers.target
 EOF
-  user_notifier_install
+  if [ "$BANNERS" = 1 ]; then user_notifier_install; else say "no user notifier unit (banners off; add with --with-banners)"; fi
   systemctl daemon-reload
   say "units written in $UNITDIR, nothing enabled yet"
 }
@@ -2244,7 +2351,7 @@ disarm() {
     else say "quic chain could NOT be flushed"; rc=1; fi
   fi
   # cancel the failsafe only once the rules are gone
-  if [ "$rc" = 0 ]; then failsafe_cancel; watchdog_stop; deadman_stop
+  if [ "$rc" = 0 ]; then rm -f "$REARM" "$EXPIRY"; failsafe_cancel; watchdog_stop; deadman_stop
   else say "the rule may still stand, so the failsafe stays armed"; fi
   # reset desktop PAC: stale one broke browsers, 1 Oct 2026
   desktop_proxy_off
@@ -2871,6 +2978,12 @@ dry_run_report() {
   say "  bash $APP/run.sh verify"
   say "  sudo /usr/local/sbin/guardrail-adm verify"
   say "  sudo /usr/local/sbin/guardrail-adm status"
+  model_last_line "$with_model" "will be "
+}
+
+model_last_line() {
+  if [ "$1" = 1 ] && [ "${MODEL_FAILED:-0}" != 1 ]; then say "model layer: ${2:-}installed; free-form names are masked"
+  else say "model layer: ${2:-}NOT installed; free-form names pass unmasked (add: guardrail-adm install --with-model)"; fi
 }
 
 
@@ -3023,6 +3136,9 @@ install_all() {
     say "install complete but DEGRADED: the model layer is missing (exit 3); retry: sudo $SELF install"
     exit 3
   fi
+  # last block: the two commands for the session already running
+  if [ -n "${GR_ENV_FILE:-}" ] && [ -r "$GR_ENV_FILE" ]; then ca_session_hint "$GR_ENV_FILE"; fi
+  model_last_line "$with_model"
 }
 
 yaml_loader_line() {
@@ -3042,6 +3158,62 @@ model_load_check() {
   else bad "model layer: the model does NOT load, so free-form names pass unmasked: $(printf '%s' "$out" | tail -n 1)"; fi
 }
 
+# invoking session's value; 1 when the session is unreadable
+session_ca_value() {
+  local name="$1" shell_pid env_file
+  shell_pid="$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')"
+  env_file="/proc/${shell_pid:-0}/environ"
+  [ -r "$env_file" ] || return 1
+  tr '\0' '\n' <"$env_file" 2>/dev/null | sed -n "s/^${name}=//p" | tail -1
+  return 0
+}
+
+# one value from the CA environment file, quotes stripped
+ca_env_value() {
+  sed -n "s/^\(export \)\{0,1\}$2=//p" "$1" 2>/dev/null | tail -1 | sed 's/^["'\'']//; s/["'\'']$//'
+}
+
+# two commands that put the CA in a live session
+ca_session_hint() {
+  local file="$1" ssl node
+  ssl="$(ca_env_value "$file" SSL_CERT_FILE)"
+  node="$(ca_env_value "$file" NODE_EXTRA_CA_CERTS)"
+  say "use the CA in this session without logging out:"
+  if [ -n "$ssl" ]; then
+    say "  export SSL_CERT_FILE=$ssl NODE_EXTRA_CA_CERTS=$node"
+  else
+    say "  export NODE_EXTRA_CA_CERTS=$node"
+  fi
+  say "  systemctl --user import-environment SSL_CERT_FILE NODE_EXTRA_CA_CERTS"
+}
+
+# WARN when the session holds pre-install CA variables
+env_pickup_check() {
+  local file="$1" sess_ssl="$2" sess_node="$3" want_ssl want_node
+  if [ -z "$file" ] || [ ! -r "$file" ]; then
+    printf '  NOT-OBSERVED  session CA variables: no readable environment file\n'
+    return 0
+  fi
+  if [ "$sess_ssl" = "-" ] || [ "$sess_node" = "-" ]; then
+    printf '  NOT-OBSERVED  session CA variables: the invoking session cannot be read\n'
+    return 0
+  fi
+  want_ssl="$(ca_env_value "$file" SSL_CERT_FILE)"
+  want_node="$(ca_env_value "$file" NODE_EXTRA_CA_CERTS)"
+  if [ "$sess_ssl" = "$want_ssl" ] && [ "$sess_node" = "$want_node" ]; then
+    printf '  OK    session CA variables: this session reads the CA from %s\n' "$file"
+  else
+    printf '  WARN  this user session has not picked up the CA yet: programs started before the install may fail while the rule is live\n'
+    if [ -n "$want_ssl" ]; then
+      printf '    export SSL_CERT_FILE=%s NODE_EXTRA_CA_CERTS=%s\n' "$want_ssl" "$want_node"
+    else
+      printf '    export NODE_EXTRA_CA_CERTS=%s\n' "$want_node"
+    fi
+    printf '    systemctl --user import-environment SSL_CERT_FILE NODE_EXTRA_CA_CERTS\n'
+  fi
+  return 0
+}
+
 verify() {
   local fail=0 p fp_conf fp_cert fp_pub fp_anchor fp_src rules ru=0 tbl
   ok() { printf '  OK    %s\n' "$*"; }
@@ -3049,6 +3221,7 @@ verify() {
   note() { printf '  NOTE  %s\n' "$*"; }
   echo "== verify"
   ok "mode in force: $(mode_line)"
+  exempt_verify
   if puser_exists; then ok "user: $(id "$PUSER"), shell $(getent passwd "$PUSER" | cut -d: -f7)"
   else bad "user $PUSER missing"; fi
   # venv python runs as root only after tree_ok passed
@@ -3098,6 +3271,12 @@ verify() {
      && { [ -z "$fp_anchor" ] || [ "$fp_anchor" = "$fp_conf" ]; } && { [ -z "$fp_src" ] || [ "$fp_src" = "$fp_conf" ]; }; then
     ok "one CA identity everywhere it is present"
   else bad "CA fingerprints differ or the CA is missing"; fi
+  # a session started before install still holds the old variables
+  local env_file s_ssl s_node
+  env_file="$(rec_get ENVFILE 2>/dev/null | tail -1)"; [ -n "$env_file" ] || env_file="${GR_ENV_FILE:-}"
+  s_ssl="$(session_ca_value SSL_CERT_FILE)" || s_ssl="-"
+  s_node="$(session_ca_value NODE_EXTRA_CA_CERTS)" || s_node="-"
+  env_pickup_check "$env_file" "$s_ssl" "$s_node"
   case "$(proxy_listeners)" in
     1:1) ok "listeners IPv4 and IPv6 on $PORT, as: $(listener_users)" ;;
     0:0) bad "listeners IPv4:IPv6 = 0:0 on $PORT: the proxy is not running; 'guardrail-adm proxy-start' starts it" ;;
@@ -3313,6 +3492,55 @@ ca_untrust() {
   say "trust removed; the CA files stay (ca-trust puts it back, uninstall removes them)"
 }
 
+EXEMPT_FILE="${GUARDRAIL_EXEMPT_FILE:-$STATE/exempt-hosts.txt}"
+
+# one host per line; the proxy rereads it, no restart
+exempt_hosts_read() { [ -r "$EXEMPT_FILE" ] && sed 's/#.*//; s/[[:space:]]//g; /^$/d' "$EXEMPT_FILE" | tr 'A-Z' 'a-z'; return 0; }
+
+exempt() {
+  local verb="${1:-list}" src="${2:-}" h tmp
+  case "$verb" in
+    list) exempt_hosts_read | sort -u; return 0 ;;
+    add|remove) ;;
+    *) die "exempt list | add FILE | remove FILE (hosts are read from a file, one per line)" ;;
+  esac
+  [ -n "$src" ] && [ -r "$src" ] || die "exempt $verb needs a readable file of hosts"
+  [ "$(id -u)" -eq 0 ] || [ -n "${GUARDRAIL_EXEMPT_FILE:-}" ] || die "exempt $verb needs root"
+  tmp="$(mktemp)" || die "mktemp failed"
+  while IFS= read -r h; do
+    h="$(printf '%s' "${h%%#*}" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+    [ -n "$h" ] || continue
+    # port is dropped: the skip matches the host only
+    case "$h" in *:*) case "${h##*:}" in ''|*[!0-9]*) die "not a host name in $src: line rejected" ;; esac; h="${h%:*}" ;; esac
+    case "$h" in [!a-z0-9]*|*[!a-z0-9.-]*|*.) die "not a host name in $src: line rejected" ;; esac
+    printf '%s\n' "$h" >>"$tmp"
+  done <"$src"
+  if [ "$verb" = add ]; then
+    { exempt_hosts_read; cat "$tmp"; } | sort -u >"$tmp.new"
+  else
+    exempt_hosts_read | sort -u | grep -vxFf "$tmp" >"$tmp.new" || true
+  fi
+  mkdir -p "$(dirname "$EXEMPT_FILE")"
+  install -m 644 "$tmp.new" "$EXEMPT_FILE"
+  rm -f "$tmp" "$tmp.new"
+  say "exempt list: $(exempt_hosts_read | wc -l) hosts"
+}
+
+exempt_verify() {
+  local h n=0 pac="${PACDIR:-/nonexistent}/guardrail.pac"
+  while IFS= read -r h; do
+    n=$((n + 1))
+    if [ ! -r "$pac" ]; then
+      note "exempt $n: PAC not readable, PAC absence not observed"
+    elif { grep -qF -- "$h" "$pac" || grep -qF -- "${h//./\\.}" "$pac"; }; then
+      bad "exempt $n: still listed in the PAC (restart the proxy to rebuild it)"
+    else
+      ok "exempt $n: skipped before any rule, absent from the PAC"
+    fi
+  done < <(exempt_hosts_read | sort -u)
+  [ "$n" -gt 0 ] || note "exempt list is empty"
+}
+
 case "${1:-}" in
   install)
     shift
@@ -3325,6 +3553,7 @@ case "${1:-}" in
     ;;
   uninstall) uninstall ;;
   verify) verify ;;
+  exempt) shift; exempt "$@" ;;
   requirements) [ "${2:-}" = --install ] && [ "$(id -u)" -ne 0 ] && die "requirements --install needs root: sudo $SELF requirements --install"
                 requirements_report || { [ "${2:-}" = --install ] && requirements_install; } ;;
   status) status ;;
@@ -3336,6 +3565,7 @@ case "${1:-}" in
   arm) arm "${2:-15m}" ;;
   disarm) disarm ;;
   failsafe-fire) failsafe_fire ;;
+  rearm-run) rearm_run ;;
   deadman-run) deadman_run ;;
   failsafe-test) failsafe_test "${2:-20}" ;;
   units-install) units_install ;;

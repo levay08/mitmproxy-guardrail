@@ -801,11 +801,14 @@ def _context_present(kind: str, text: str, start: int, end: int) -> bool:
 # Names no person; masking it broke the commit trailer.
 ROLE_MAILBOX = re.compile(r"(?i)(?:no[-_.]?reply|do[-_.]?not[-_.]?reply)@[\w-]+(?:\.[\w-]+)+")
 
+# A value needs a digit or symbol.
+SECRET_SHAPE = r"(?=\S{6,64}\b)(?=\S*[\d!@#$%^&*_\-=+])(?![\"'`]?[$(\[{<])\S+"
+
 PII_RULES: list[tuple[str, re.Pattern]] = [
     # Bounded local part; the open form was quadratic.
     ("EMAIL", re.compile(r"\b[\w.+-]{1,254}@[\w-]+(?:\.[\w-]+)*\.[^\W\d_]{2,}\b")),
     # Emails written as "name (at) domain (dot) tld" or similar.
-    ("EMAIL_TERSAMAR", re.compile(r"[A-Za-z0-9._%+-]{1,64}\s*(?:\(at\)|\[at\]|@|\uff20)\s*"
+    ("EMAIL_TERSAMAR", re.compile(r"[A-Za-z0-9._%+-]{1,64}(?:\s*(?:\(at\)|\[at\])\s*|@|\uff20)"
                                   r"[A-Za-z0-9.-]{1,63}\s*(?:\(dot\)|\[dot\]|\.)\s*"
                                   r"[A-Za-z]{2,24}\b")),
     ("KUNCI_API", re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9]{16,}\b"
@@ -824,16 +827,16 @@ PII_RULES: list[tuple[str, re.Pattern]] = [
         r"|\binstruksi\s+baru\s*:|\btimpa\s+(?:aturan|panduan)(?:mu|\s+kamu)\b")),
     ("NIK_KTP", re.compile(r"\b\d{16}\b")),
     ("NO_HP_ID", re.compile(r"\b(?:\+62|62|0)8[1-9]\d{7,11}\b")),
-    ("KUNCI_PRIVAT", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    # A header alone, with no body, is no key.
+    ("KUNCI_PRIVAT", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
+                                r"(?=\s*(?:Proc-Type:|DEK-Info:|[A-Za-z0-9+/=]{16,}))")),
     ("PASSWORD", re.compile(r"(?i)\b(?:password|passwd|pwd|secret|token|kata\s+sandi|sandi)\b"
                             r"(?:\s*[:=]\s*(?!(?:" + NOT_PASSWORD_WORDS + r")\b)\S+"
                             r"|\s+(?:saya|aku|ku|gue|milik\s+saya|is)\s+"
                             r"(?:(?:adalah|ialah|yaitu)\s+)?"
-                            r"(?!(?:" + NOT_PASSWORD_WORDS + r")\b)\S+"
-                            r"|\s+(?:adalah|ialah|yaitu)\s+(?!(?:" + NOT_PASSWORD_WORDS + r")\b)\S+"
-                            r"|\s+(?!(?:" + NOT_PASSWORD_WORDS + r")\b)"
-                            # Needs a digit or symbol; a bare word is not.
-                            r"(?=\S{6,64}\b)(?=\S*[\d!@#$%^&*_\-=+])\S+)")),
+                            r"(?!(?:" + NOT_PASSWORD_WORDS + r")\b)" + SECRET_SHAPE +
+                            r"|\s+(?:adalah|ialah|yaitu)\s+(?!(?:" + NOT_PASSWORD_WORDS + r")\b)" + SECRET_SHAPE +
+                            r"|\s+(?!(?:" + NOT_PASSWORD_WORDS + r")\b)" + SECRET_SHAPE + r")")),
     # Street address: street word plus house number required.
     ("ALAMAT_JALAN", re.compile(r"(?i)\b(?:jl\.?|jalan|gg\.?|gang|perum(?:ahan)?|blok)\s*"
                                 r"[^,\n]{2,40}?\b(?:no\.?|nomor|kav\.?|blok)\s*\.?\s*\d{1,4}[a-z]?\b")),
@@ -870,16 +873,21 @@ GROUP_RULES: list[tuple[str, re.Pattern]] = [
     ("SANDI_PANJANG", re.compile(r"(?i)(\b(?:password(?:nya)?|kata\s+sandi(?:nya)?|sandi(?:nya)?)\b"
                                  r"[^\n]{0,40}?)"
                                  # A quoted value may contain spaces; take it whole.
-                                 r"(\"[^\"\n]{6,64}\"|'[^'\n]{6,64}'"
-                                 r"|(?=\S{8,64}(?!\S))(?=\S*\d)(?=\S*[A-Z])(?=\S*[a-z])\S+)")),
+                                 r"(\"(?=[^\"\n]*\d)[^\"\n]{6,64}\"|'(?=[^'\n]*\d)[^'\n]{6,64}'"
+                                 r"|(?!\S*\[redacted_)(?=\S{8,64}(?!\S))(?=\S*\d)(?=\S*[A-Z])(?=\S*[a-z])\S+)")),
     # Secret label next to a high-entropy value: "AWS key 12399asAaweER0v19890".
     ("RAHASIA_KONTEKS", re.compile(r"(?i)\b(?:aws\s*(?:key|secret)|api\s*key|secret\s*(?:key|token)?|"
                                    r"access\s*key|private\s*key|token)\b[^\n]{0,20}?"
-                                   r"([A-Za-z0-9!@#$%^&*_\-=+]{16,64})\b")),
+                                   r"(?<![A-Za-z0-9!@#$%^&*_\-=+])"
+                                   r"((?=[A-Za-z0-9!@#$%^&*_\-=+]*\d)(?=[A-Za-z0-9!@#$%^&*_\-=+]*[A-Za-z])"
+                                   r"[A-Za-z0-9!@#$%^&*_\-=+]{16,64})\b")),
 ]
 
 # Card number; a Luhn check keeps ordinary digit runs out.
 CARD_RE = re.compile(r"\b(?:\d[ -]?){12,18}\d\b")
+# Separators only between 4-4-4-4 or 4-6-5 groups.
+CARD_GROUPS = re.compile(r"\d{4}([ -])\d{4}\1\d{4}\1\d{1,7}|\d{4}([ -])\d{6}\2\d{4,5}")
+DATE_STAMP = re.compile(r"(?:19|20)\d\d(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])")
 
 # Full four octets, checked in code for a private range.
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -2166,7 +2174,7 @@ def learn_endpoint(host: str, reason: str = "", source: str = "") -> bool:
     if os.environ.get("GUARDRAIL_NO_LEARN") == "1":
         return False
     host = (host or "").strip().lower().lstrip(".")
-    if not host or "." not in host or host in learned_hosts():
+    if not host or "." not in host or host in learned_hosts() or is_exempt(host):
         return False
     if any(re.search(p, host) for p in AI_PROVIDER_HOSTS if p and not p.startswith("(")):
         return False
@@ -2183,9 +2191,54 @@ def learn_endpoint(host: str, reason: str = "", source: str = "") -> bool:
     return True
 
 
+EXEMPT_FILE_NAME = "exempt-hosts.txt"
+_EXEMPT_CACHE: tuple = (None, ())
+
+
+def exempt_hosts() -> tuple:
+    """Exact hosts never inspected; reread when the file changes."""
+    global _EXEMPT_CACHE
+    path = state_dir() / EXEMPT_FILE_NAME
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        stamp = None
+    if _EXEMPT_CACHE[0] != stamp:
+        hosts: list[str] = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines() if stamp else []:
+                name = line.split("#")[0].strip().lower().rstrip(".")
+                if name and name not in hosts:
+                    hosts.append(name)
+        except OSError:
+            pass
+        _EXEMPT_CACHE = (stamp, tuple(hosts))
+    return _EXEMPT_CACHE[1]
+
+
+def is_exempt(host: str) -> bool:
+    """True for a host on the exempt list."""
+    return (host or "").strip().lower().rstrip(".") in exempt_hosts()
+
+
+def drop_exempt(patterns) -> list:
+    """Patterns that fully match an exempt host are removed."""
+    gone = exempt_hosts()
+    kept = []
+    for pattern in patterns:
+        try:
+            if any(re.fullmatch(pattern, host) for host in gone):
+                continue
+        except re.error:
+            pass
+        kept.append(pattern)
+    return kept
+
+
 def host_patterns() -> list[str]:
     """All hosts the proxy opens: the list, learned, app-implied."""
-    return list(AI_PROVIDER_HOSTS) + [re.escape(h) for h in learned_hosts()] + installed_host_patterns()
+    return drop_exempt(list(AI_PROVIDER_HOSTS) + [re.escape(h) for h in learned_hosts()]
+                       + installed_host_patterns())
 
 
 def installed_host_patterns() -> list[str]:
@@ -3112,8 +3165,73 @@ def dlp_status() -> dict:
     return dict(DLP_STATE)
 
 
+# Owner ruling 2026-10-15: product, vendor, agent names never masked.
+OWNER_NAMES = frozenset({"claude", "anthropic", "hermes", "nous"})
+
+
+def is_owner_name(value: str) -> bool:
+    """True when the whole span is one of OWNER_NAMES."""
+    return value.strip().strip("`'\"“”.,;:!?()[]{}").lower() in OWNER_NAMES
+
+
+# URL userinfo is a credential slot, not a mailbox.
+_URL_USERINFO = re.compile(r"://[^\s/@]*$")
+
+# Value shapes that are code, placeholders or words, not secrets.
+_CODE_SHAPE = re.compile(
+    r"(?i)^(?:[\w.$]*[(\[{<]|\$|\{\{|process\.env|os\.environ|HTTP/|your[-_ .]|[a-z]+(?:-[a-z]+)+$"
+    r"|\d{1,7}$|[a-z]*_[a-z_]*$)|x{4,}|\.{3}|&\w+=|example|changeme|placeholder")
+# A literal filler in a URL credential slot.
+_URL_FILLER = re.compile(
+    r"(?i)(?:pass(?:word|wd)?|pwd|secret|token|any\w*|x+|\*+|changeme|\$\{?\w+\}?)|.*example.*")
+
+
+# Known credential prefixes skip the code-shape veto.
+_CRED_PREFIX = re.compile(r"^(?:github_pat_|gh[pousr]_|glpat-|xox[abprs]-)[A-Za-z0-9_-]{16,}$")
+
+
+def plausible_secret(value: str) -> bool:
+    """False for code, placeholders, short numbers and plain words."""
+    v = value.strip().strip("\"'`,;.)")
+    if _CRED_PREFIX.match(v):
+        return True
+    if not v or _CODE_SHAPE.search(v):
+        return False
+    return not (re.fullmatch(r"[A-Za-z_.-]+", v) and len(v) < 12)
+
+
+def _group_vetoed(kind: str, prefix: str, value: str) -> bool:
+    """True when a group-rule value is not a real secret."""
+    if kind == "SANDI_ENV":
+        return bool(re.search(r"(?i)tokens\s*[:=]\s*$", prefix)) or not plausible_secret(value)
+    if kind == "SANDI_SINGKAT":
+        return value.startswith("$") or "/" in value
+    if kind == "KREDENSIAL_URL":
+        return bool(_URL_FILLER.fullmatch(value))
+    return False
+
+
+_PW_VALUE = re.compile(r"(?i)^(?:kata\s+sandi|\w+)(?:\s*[:=]\s*|\s+(?:(?:saya|aku|ku|gue|milik\s+saya|is)\s+)?"
+                       r"(?:(?:adalah|ialah|yaitu)\s+)?)")
+
+
+def _pw_vetoed(match_text: str) -> bool:
+    """True when the keyword's value is no secret."""
+    head = _PW_VALUE.match(match_text)
+    return not plausible_secret(match_text[head.end():] if head else match_text)
+
+
+def _weak_value(kind: str, text: str) -> bool:
+    """True for a keyword match whose value is no secret."""
+    if kind != "PASSWORD":
+        return False
+    return _pw_vetoed(text)
+
+
 def _token(kind: str, counters: dict, mapping: dict, value: str) -> str:
     """One token per value: same value, same token."""
+    if is_owner_name(value):
+        return value
     for tok, original in mapping.items():
         if original == value:
             return tok
@@ -3188,7 +3306,11 @@ def mask_text(text: str, counters: dict, mapping: dict,
             if not _context_present(kind, s, m.start(), m.end()):
                 # No nearby word marks this as personal; leave the number.
                 return m.group(0)
+            if is_owner_name(m.group(0)) or _weak_value(kind, m.group(0)):
+                return m.group(0)
             if kind.startswith("EMAIL") and ROLE_MAILBOX.fullmatch(m.group(0)):
+                return m.group(0)
+            if kind == "EMAIL" and _URL_USERINFO.search(s[max(0, m.start() - 80):m.start()]):
                 return m.group(0)
             if kind.startswith("AI_PROMPT_INJECTION") and quoted_discussion(s, m.group(0)):
                 return m.group(0)
@@ -3205,6 +3327,8 @@ def mask_text(text: str, counters: dict, mapping: dict,
                 return m.group(0)
             value = m.group(idx)
             prefix = m.group(0)[: m.start(idx) - m.start(0)]
+            if is_owner_name(value) or _group_vetoed(kind, prefix, value):
+                return m.group(0)
             kinds.append(kind)
             return prefix + _token(kind, counters, mapping, value)
 
@@ -3224,6 +3348,10 @@ def mask_text(text: str, counters: dict, mapping: dict,
         digits = re.sub(r"\D", "", raw)
         # Epoch timestamps pass Luhn one time in ten.
         if raw == digits and digits[0] == "1" and len(digits) in (13, 16, 19):
+            return raw
+        if raw != digits and not CARD_GROUPS.fullmatch(raw):
+            return raw
+        if DATE_STAMP.match(digits):
             return raw
         if 13 <= len(digits) <= 19 and _luhn_ok(digits):
             kinds.append("NOMOR_KARTU")
@@ -3519,6 +3647,8 @@ def _apply_corpus_rule(rule: dict, out: str, counters: dict, mapping: dict,
                 continue
         if stripped.isdigit() and len(stripped) < CORPUS_MIN_DIGITS:
             # Bare digits need a nearby word and enough length.
+            continue
+        if is_owner_name(raw):
             continue
         kinds.append(kind)
         out = out[:match.start()] + _token(kind, counters, mapping, raw) + out[match.end():]
@@ -4191,6 +4321,8 @@ def _maskable(ent: dict, text: str) -> bool:
     """Reject model findings that are not proper names."""
     label = str(ent.get("label") or "").lower()
     span = text[ent.get("start", 0):ent.get("end", 0)]
+    if is_owner_name(span):
+        return False
     if span.strip().lower().strip("`'\".,;:") in NULLISH:
         return False
     if label == "username" and MODEL_NAME.fullmatch(span.strip()):

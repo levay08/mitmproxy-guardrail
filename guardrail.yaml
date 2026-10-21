@@ -2,15 +2,11 @@
 # Edit, save, then restart the guardrail.
 
 providers:
-  # Test media only: these are what the armed pass inspects and exercises.
-  # The working tools (Claude, DeepSeek, the local Hermes provider) are deliberately NOT here:
-  # mitmproxy's allow_hosts is an interception scope, so anything listed can be masked AND blocked.
-  #
-  # Anthropic added 4 Oct 2026: leaving it out is what let an SSH password and an AWS key reach
-  # Claude in clear. In neutral mode (the shipped default) external rules warn and never block and
-  # no dlp rule declares action: block, so listing it buys masking without risking a 403 on the
-  # owner's working tool. Switching mode to persistent makes external rules enforce, so re-read
-  # this line before doing that.
+  # Hosts the guardrail inspects: masked, and blocked when a rule enforces.
+  # allow_hosts is an interception scope; list only hosts to inspect.
+  # Neutral mode (default): external rules warn only.
+  # Persistent mode: external rules enforce.
+  # Exempt hosts (guardrail-adm exempt) are never inspected.
   - api\.anthropic\.com
   - console\.anthropic\.com
   - statsig\.anthropic\.com

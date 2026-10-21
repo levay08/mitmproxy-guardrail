@@ -8,7 +8,12 @@ scans traffic, never touches a rule or a verdict. Its one read of the audit log
 is the banner follower: new MASK and BLOCK lines, and requests forwarded because the
 attack rules were not loaded, become a desktop banner built
 from host, action and rule labels only, never from prompt text.
-Knobs: WATCHDOG_INTERVAL (5s) WATCHDOG_TIMEOUT (4s) WATCHDOG_FAILS (3)
+Busy is not dead: a health request that times out while both ports accept and the
+proxy process lives is logged as busy and never counts as a miss. Only a closed
+port (after retries with backoff) or a gone process is a death verdict.
+No AI, no model call, no agent page anywhere here: script and log only.
+Knobs: WATCHDOG_INTERVAL (5s) WATCHDOG_TIMEOUT (30s) WATCHDOG_FAILS (3)
+WATCHDOG_PROC (mitmdump) WATCHDOG_RETRIES (3)
 WATCHDOG_COUNTDOWN (10s) WATCHDOG_DRY=1 observe only, WATCHDOG_NO_NOTIFY=1.
 Banners: WATCHDOG_AUDIT (audit path) WATCHDOG_BANNER_COOL (60s per key)
 WATCHDOG_BANNER_MAX (6 per minute) WATCHDOG_BANNER_SCOPE=all|person WATCHDOG_BANNERS=0 off
@@ -49,7 +54,9 @@ def knob(name: str, default: float, low: float) -> float:
 PORT = int(knob("GUARDRAIL_PORT", 8899, 1))
 REGULAR_PORT = int(knob("GUARDRAIL_REGULAR_PORT", 8898, 1))
 INTERVAL = knob("WATCHDOG_INTERVAL", 5, 0.2)
-TIMEOUT = knob("WATCHDOG_TIMEOUT", 4, 0.2)
+TIMEOUT = knob("WATCHDOG_TIMEOUT", 30, 0.2)
+RETRIES = int(knob("WATCHDOG_RETRIES", 3, 1))
+PROC_NEEDLE = os.environ.get("WATCHDOG_PROC", "mitmdump")
 FAILS = int(knob("WATCHDOG_FAILS", 3, 1))
 COUNTDOWN = int(knob("WATCHDOG_COUNTDOWN", 10, 1))
 RULE_EVERY = knob("WATCHDOG_RULE_EVERY", 300, 1)
@@ -214,22 +221,59 @@ def notify(title: str, body: str, urgent: bool = False) -> None:
         log(f"  banner NOT shown: {exc.__class__.__name__}", echo=False)
 
 
-def probe(timeout: float = TIMEOUT) -> str | None:
-    """None if the proxy is fine, else why not."""
+def proxy_process_alive() -> bool:
+    """Any process whose cmdline holds the needle."""
+    me = os.getpid()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == me:
+            continue
+        try:
+            if PROC_NEEDLE.encode() in (entry / "cmdline").read_bytes():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def port_accepts(port: int, timeout: float) -> bool:
     try:
-        socket.create_connection(("127.0.0.1", PORT), timeout).close()
-    except OSError as exc:
-        return f"no listener on :{PORT} ({exc.__class__.__name__})"
+        socket.create_connection(("127.0.0.1", port), timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def probe_state(timeout: float = TIMEOUT) -> tuple[str, str]:
+    """('ok'|'busy'|'dead', reason); busy never counts as death."""
+    for attempt in range(RETRIES):
+        if port_accepts(PORT, min(timeout, 2.0)):
+            break
+        if attempt < RETRIES - 1:
+            time.sleep(min(0.25 * 2 ** attempt, timeout))
+    else:
+        return "dead", f"no listener on :{PORT} after {RETRIES} tries"
     try:
         with socket.create_connection(("127.0.0.1", REGULAR_PORT), timeout) as conn:
             conn.settimeout(timeout)
             conn.sendall(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n")
             head = conn.recv(16)
     except socket.timeout:
-        return f"health request hung for {timeout:g}s"
+        if proxy_process_alive() and port_accepts(PORT, 2.0):
+            return "busy", f"health request slow for {timeout:g}s; process alive, :{PORT} listening"
+        return "dead", f"health request hung for {timeout:g}s and the proxy process is gone"
     except OSError as exc:
-        return f"health request failed on :{REGULAR_PORT} ({exc.__class__.__name__})"
-    return None if head.startswith(b"HTTP/") else f"health answer was not HTTP: {head[:8]!r}"
+        if port_accepts(REGULAR_PORT, 2.0):
+            return "busy", f"health request failed ({exc.__class__.__name__}) but :{REGULAR_PORT} still accepts"
+        return "dead", f"regular port :{REGULAR_PORT} closed ({exc.__class__.__name__})"
+    if head.startswith(b"HTTP/"):
+        return "ok", ""
+    return "dead", f"health answer was not HTTP: {head[:8]!r}"
+
+
+def probe(timeout: float = TIMEOUT) -> str | None:
+    """None if alive (ok or busy), else why dead."""
+    state, why = probe_state(timeout)
+    return why if state == "dead" else None
 
 
 def network_up() -> bool:
@@ -338,6 +382,7 @@ def countdown(reason: str) -> str:
         log("the machine has no network at all; the guardrail is not the cause; touching nothing")
         notify("Guardrail watchdog", "No network at all on this machine: not the guardrail, nothing changed")
         return "no-network"
+    log(f"VERDICT dead (not busy): {reason}")
     log(f"ANOMALY: {reason}; reverting in {COUNTDOWN}s unless the proxy answers again")
     notify("Guardrail ANOMALY", f"{reason}. Reverting to normal in {COUNTDOWN}s", urgent=True)
     deadline = time.monotonic() + COUNTDOWN
@@ -351,7 +396,7 @@ def countdown(reason: str) -> str:
             shown = left
             notify("Guardrail ANOMALY", f"Reverting to normal in {left}s", urgent=True)
         tick = time.monotonic() + 1
-        if probe(1.0) is None:
+        if probe_state(1.0)[0] != "dead":
             log("  the proxy answers again; revert cancelled")
             notify("Guardrail watchdog", "Proxy answers again: revert cancelled")
             return "recovered"
@@ -406,10 +451,17 @@ def run() -> int:
             log(f"{state}: proxy active, watchdog active")
             notify("Guardrail ARMED", f"{state}; proxy active on :{PORT}; watchdog active")
         misses, bad_rule, probes, last_rule = 0, 0, 0, time.monotonic()
-        suppressed, retry_at = False, 0.0
+        suppressed, retry_at, busy_log = False, 0.0, -60.0
         while not STOP.is_set():
-            why_not = pending if probes == 0 else probe()
+            if probes == 0:
+                why_not, state = pending, "dead" if pending else "ok"
+            else:
+                state, why = probe_state()
+                why_not = why if state == "dead" else None
             probes += 1
+            if state == "busy" and time.monotonic() - busy_log >= 60:
+                busy_log = time.monotonic()
+                log(f"busy, not dead, rule kept: {why}")
             if why_not is None:
                 if misses:
                     log(f"proxy answers again after {misses} miss(es)")
