@@ -20,3 +20,5 @@ proxy.log
 *.pid
 *.bak-*
 .pytest_cache/
+
+guardrail.local.yaml

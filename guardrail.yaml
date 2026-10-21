@@ -2,19 +2,12 @@
 # Edit, save, then restart the guardrail.
 
 providers:
-  # Hosts the guardrail inspects: masked, and blocked when a rule enforces.
-  # allow_hosts is an interception scope; list only hosts to inspect.
-  # Neutral mode (default): external rules warn only.
-  # Persistent mode: external rules enforce.
-  # Exempt hosts (guardrail-adm exempt) are never inspected.
+  # Hosts this guardrail inspects. Add your own work endpoints in guardrail.local.yaml
+  # and start with GUARDRAIL_CONFIG=<that file>; the shipped default stays generic.
   - api\.anthropic\.com
   - console\.anthropic\.com
   - statsig\.anthropic\.com
-  # Browser chat UIs, added 4 Oct 2026. The PAC is built from this list, so a web
-  # host missing here is never proxied and its prompt leaves in clear: that is how
-  # chat.z.ai produced zero audit records while the owner was testing it.
   - claude\.ai
-  - chat\.z\.ai
   - chat\.deepseek\.com
   - chatglm\.cn
   - kimi\.moonshot\.cn
@@ -34,7 +27,6 @@ providers:
   - aistudio\.google\.com
   - makersuite\.google\.com
   - cloudcode-pa\.googleapis\.com
-  - api\.x\.ai
   - grok\.com
   - api\.mistral\.ai
   - chat\.mistral\.ai
@@ -43,41 +35,11 @@ providers:
   - openrouter\.ai
   - api\.together\.xyz
   - api\.perplexity\.ai
-  - huggingface\.co
-  - ollama\.com
   - api\.githubcopilot\.com
   - copilot-proxy\.githubusercontent\.com
-  - api2?\.cursor\.sh
-  - \.codeium\.com
   - \.openai\.azure\.com
-  - bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com
   - dashscope\.aliyuncs\.com
-  - api\.replicate\.com
-  - api\.fireworks\.ai
   - api\.moonshot\.cn
-  - open\.bigmodel\.cn
-  - aip\.baidubce\.com
-  - 127\.0\.0\.1(:9999|:1143[45])?      # the local mock provider used by the tests
-  - test\.example\.com  # found in use
-  - api\.snapcraft\.io  # found in use
-
-# NAT64 prefixes of the network you are on (IPv6-only networks with DNS64).
-# A client there dials <prefix>+<IPv4> instead of the IPv4 itself; each prefix listed
-# here gets the synthesised form of every watched IPv4 in the v6 set (redirect, QUIC
-# reject) and is exempt from the reset of unknown IPv6. Absent = 64:ff9b::/96 only.
-# Allowed lengths: /32 /40 /48 /56 /64 /96 (RFC 6052). A bad entry is reported by
-# arm or set-sync and skipped; an empty result falls back to the default.
-# The list replaces the default: keep 64:ff9b::/96 in it when you still need it.
-# Read from the installed copy of this file at arm and set-sync.
-# nat64_prefixes:
-#   - 64:ff9b::/96        # well-known prefix (RFC 6052)
-#   - 64:ff9b:1::/48      # local-use prefix (RFC 8215)
-#   - 2001:db8:64::/96    # your operator's prefix, from its DNS64 or 'ipv4only.arpa' AAAA
-
-# Your own data rules, on top of the built-in set.
-# action: mask = token, block = HTTP 403, warn = notify only.
-# group: true = the last bracket group is the secret.
-# notify_in_reply: name masked kinds in the reply too.
 notify_in_reply: true
 
 # DLP data: rule corpora, name lists, validators. false = off.
