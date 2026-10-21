@@ -1898,6 +1898,10 @@ class Guardrail:
             return
         self._refresh_patterns()
         host = _flow_host(flow)
+        if rules.is_exempt(host):
+            size = len(flow.request.content or b"")
+            audit(audit_record("EXEMPT", host, uuid.uuid4().hex[:8], chars_in=size, chars_out=size))
+            return
         loaded = self._load_payload(flow, host)
         if loaded is None:
             return
@@ -2072,7 +2076,9 @@ class Guardrail:
                 if new != text:
                     replaced[text] = new
             masked = _apply_replaced(masked, replaced) if replaced else masked
-            dlp_state = {"error": "data base not loaded; validators only"}
+            why = "; ".join(str(e) for e in rules.DLP_STATE.get("errors") or [])[:200]
+            dlp_state = {"error": "data base not loaded; validators only",
+                         "load_errors": why}
         return {"ext": ext, "ext_state": ext_state, "masked": masked, "counters": counters,
                 "mapping": mapping, "kinds": sorted(counters), "sem_state": sem_state,
                 "dlp_state": dlp_state}
@@ -2352,6 +2358,8 @@ class Guardrail:
             return
         raw = msg.text
         host = _flow_host(flow)
+        if rules.is_exempt(host):
+            return
         if raw.lstrip()[:1] not in ("{", "["):
             self._ws_unparsed(flow, host, raw, "not-json")
             return
@@ -2704,7 +2712,7 @@ def _cli_pac(argv: list[str]) -> int:
         f"//   gsettings set org.gnome.system.proxy autoconfig-url 'file://{target}'\n"
         "// Disable:\n"
         "//   gsettings set org.gnome.system.proxy mode 'none'\n",
-        proxy, rules.AI_PROVIDER_HOSTS))
+        proxy, rules.drop_exempt(rules.AI_PROVIDER_HOSTS)))
     print(f"written: {target}  ({len(rules.AI_PROVIDER_HOSTS)} endpoints from {cfg['path']})")
     return 0
 
