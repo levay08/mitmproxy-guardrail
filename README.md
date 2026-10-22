@@ -20,7 +20,12 @@ bash guardrail-adm install --dry-run
 
 Install does not divert any traffic. After it, nothing of yours is guarded yet. Check the install read-only with `bash run.sh verify` (run.sh is the user launcher in this folder).
 
-Before you arm, log out and in once so clients pick up the CA (see Manual steps). A client that does not trust the CA fails completely while the rule is live.
+While the rule is live, a client that does not trust the CA fails completely. Browsers need nothing:
+install writes the CA into the system store and the NSS store, and they read it as they go. Only a
+program that read its CA variables at start (python, curl, node with SSL_CERT_FILE or
+NODE_EXTRA_CA_CERTS) has to be restarted, or you log out and in once, before you arm - see Manual steps.
+Disarming needs none of that: the rule is removed and traffic goes direct again with the provider's own
+certificate, so a client that never picked up the CA works the moment you disarm.
 
 To start guarding, arm the rule. `arm` takes a window of 300 s to 3600 s (example 15m) after which the rule is released by itself. Install puts `guardrail-adm` in `/usr/local/sbin`:
 
