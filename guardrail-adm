@@ -952,8 +952,22 @@ seed_endpoints() {
   say "resolving the watched hosts as $who"
   as_user "$who" env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$home" GUARDRAIL_HOME="$home" \
     GUARDRAIL_CONFIG="$RUN_APP/guardrail.yaml" "$py" -I -c \
-    'import sys; sys.path.insert(0, sys.argv[1]); import rules; sys.exit(0 if rules.ai_endpoint_ips() else 1)' \
-    "$RUN_APP" >/dev/null 2>&1
+    'import sys; sys.path.insert(0, sys.argv[1]); import rules; rules.load_config(); sys.exit(0 if rules.ai_endpoint_ips() else 1)' \
+    "$RUN_APP" >/dev/null 2>&1 || return 1
+  yaml_stamp_write
+}
+
+# yaml digest of the last resolve; install keeps old mtimes
+YAML_STAMP="$LIBDIR/endpoint-yaml.sha256"
+yaml_digest() { sha256sum -- "$RUN_APP/guardrail.yaml" 2>/dev/null | cut -d' ' -f1; }
+yaml_stamp_write() {
+  local d; d="$(yaml_digest)"
+  [ -n "$d" ] && [ -d "$LIBDIR" ] && [ ! -L "$YAML_STAMP" ] || return 0
+  printf '%s\n' "$d" >"$YAML_STAMP.new" && mv -f "$YAML_STAMP.new" "$YAML_STAMP" || true
+}
+yaml_changed() {
+  local d; d="$(yaml_digest)"
+  [ -n "$d" ] && [ "$d" != "$(cat "$YAML_STAMP" 2>/dev/null)" ]
 }
 
 # seconds an address list may age before arm resolves again
@@ -965,9 +979,10 @@ refresh_stale_endpoints() {
   [ "$DEV" = 1 ] && f="$APP/data/endpoint-ips.json"
   [ -f "$f" ] && [ ! -L "$f" ] || return 0
   age=$(( $(date +%s) - $(stat -c %Y -- "$f") ))
-  [ "$age" -gt "$ENDPOINT_MAX_AGE" ] || return 0
+  # yaml newer or changed skips the age wait
+  [ "$age" -gt "$ENDPOINT_MAX_AGE" ] || [ "$RUN_APP/guardrail.yaml" -nt "$f" ] || yaml_changed || return 0
   was="$(stat -c %Y -- "$f")"
-  say "endpoint list is $((age / 3600)) h old: resolving the watched hosts again"
+  say "endpoint list is $((age / 60)) min old or older than the yaml: resolving the watched hosts again"
   # DNS down returns the old cache; check file time
   seed_endpoints && [ "$(stat -c %Y -- "$f" 2>/dev/null)" != "$was" ] \
     || say "refresh failed (no DNS?): keeping the list from $(date -d "@$was" '+%F %T')"
@@ -1277,7 +1292,7 @@ arm_failsafe() {
     systemd) ;;
     background)
       # no systemd: detached sleeper must be alive before add_rule
-      if [ -f "$FSPID" ]; then kill "$(cat "$FSPID")" 2>/dev/null; rm -f "$FSPID"; fi
+      if [ -f "$FSPID" ]; then grep -qa failsafe-fire "/proc/$(cat "$FSPID")/cmdline" 2>/dev/null && kill "$(cat "$FSPID")" 2>/dev/null; rm -f "$FSPID"; fi
       setsid nohup /bin/sh -c "sleep $secs; exec '$SELF' failsafe-fire" >/dev/null 2>&1 </dev/null &
       pid=$!
       echo "$pid" >"$FSPID"
@@ -1372,7 +1387,7 @@ failsafe_cancel() {
     systemctl reset-failed "$UNIT.service" "$UNIT.timer" >/dev/null 2>&1
   fi
   if [ -f "$FSPID" ]; then
-    kill "$(cat "$FSPID")" 2>/dev/null
+    grep -qa failsafe-fire "/proc/$(cat "$FSPID")/cmdline" 2>/dev/null && kill "$(cat "$FSPID")" 2>/dev/null
     rm -f "$FSPID"
   fi
 }
@@ -1766,7 +1781,7 @@ proxy_stop() {
 }
 
 status() {
-  local rp
+  local rp rc=0
   need_nft
   say "== divert chain"
   $NFT list chain inet guardrail divert 2>&1
@@ -1781,7 +1796,7 @@ status() {
   case "$rp" in
     0) say "   diverting: uid $UID_TARGET tcp 443 to :$PORT, IPv4 and IPv6" ;;
     1) say "   not diverting: no complete redirect for uid $UID_TARGET to :$PORT" ;;
-    *) say "   UNKNOWN: nft could not be read, so no claim is made either way" ;;
+    *) say "   UNKNOWN: nft could not be read, so no claim is made either way"; rc=2 ;;
   esac
   say "== protection window"
   rp=0; rule_present || rp=$?
@@ -1792,7 +1807,7 @@ status() {
   say "== failsafe ($(failsafe_method))"
   if [ "$HAS_SYSTEMD" = 1 ]; then
     systemctl list-timers --all 'guardrail*' --no-pager 2>&1 | sed -n '1,3p'
-  elif [ -f "$FSPID" ] && kill -0 "$(cat "$FSPID")" 2>/dev/null; then
+  elif [ -f "$FSPID" ] && grep -qa failsafe-fire "/proc/$(cat "$FSPID")/cmdline" 2>/dev/null; then
     say "   background failsafe armed, pid $(cat "$FSPID")"
   else
     say "   no background failsafe armed"
@@ -1808,12 +1823,16 @@ status() {
   say "== last records"
   # read as the file owner: symlinks must not feed root
   if puser_exists && [ -d "$STATE/data" ]; then
-    as_puser tail -2 "$STATE/data/history.log" 2>&1
+    if as_puser test -f "$STATE/data/history.log"; then as_puser tail -2 "$STATE/data/history.log" 2>&1 || rc=3
+    else say "   no records yet"; fi
   elif [ -z "$APP" ] || [ -z "$OWNER" ]; then
     say "app $APP_NOTE"
   else
-    as_owner tail -2 "$APP/data/history.log" 2>&1
+    if as_owner test -f "$APP/data/history.log"; then as_owner tail -2 "$APP/data/history.log" 2>&1 || rc=3
+    else say "   no records yet"; fi
   fi
+  # rc: 0 ok, 2 nft unreadable, 3 records unreadable
+  return "$rc"
 }
 
 failsafe_test() {
@@ -1923,7 +1942,8 @@ e2e_atr_verdict() {
 e2e_probe_one() {
   local url="$1" af="$2" probe="$3" sha="$4" bodyf="$5" before after code cexit new stat v
   before=0; [ -f "$af" ] && before="$(wc -l <"$af" 2>/dev/null || echo 0)"
-  code="$(as_owner curl -s --noproxy '*' -o "$bodyf" -w '%{http_code}' --max-time 20 \
+  # -4: proxy upstream over v6 hangs, curl gets no fallback
+  code="$(as_owner curl -4 -s --noproxy '*' -o "$bodyf" -w '%{http_code}' --max-time 20 \
           -H 'content-type: application/json' -d "$probe" "$url" 2>/dev/null)"
   cexit=$?
   after=0; [ -f "$af" ] && after="$(wc -l <"$af" 2>/dev/null || echo 0)"
@@ -2119,6 +2139,7 @@ arm() {
   ARM_OK=0
   trap 'if [ "${ARM_OK:-0}" != 1 ]; then say "arm did not complete: taking the rule back"; disarm; fi' EXIT
   desktop_proxy_on
+  session_env_push
   set_sync
   # no rule without a dead-man switch: failsafe comes first
   arm_failsafe "${1:-15m}"
@@ -3136,6 +3157,7 @@ install_all() {
     say "install complete but DEGRADED: the model layer is missing (exit 3); retry: sudo $SELF install"
     exit 3
   fi
+  session_env_push
   # last block: the two commands for the session already running
   if [ -n "${GR_ENV_FILE:-}" ] && [ -r "$GR_ENV_FILE" ]; then ca_session_hint "$GR_ENV_FILE"; fi
   model_last_line "$with_model"
@@ -3185,6 +3207,27 @@ ca_session_hint() {
     say "  export NODE_EXTRA_CA_CERTS=$node"
   fi
   say "  systemctl --user import-environment SSL_CERT_FILE NODE_EXTRA_CA_CERTS"
+}
+
+# CA variables into the owner's user manager for later programs
+session_env_push() {
+  local file n v have set_args=() run="/run/user/$UID_TARGET"
+  [ -n "$OWNER" ] && [ -S "$run/bus" ] || { say "session CA variables not pushed: no user manager for ${OWNER:-owner}"; return 0; }
+  file="$(rec_get ENVFILE 2>/dev/null | tail -1)"; [ -n "$file" ] || file="${GR_ENV_FILE:-}"
+  [ -n "$file" ] && [ -r "$file" ] || { say "session CA variables not pushed: no environment file"; return 0; }
+  have="$(as_owner env "XDG_RUNTIME_DIR=$run" systemctl --user show-environment 2>/dev/null)" \
+    || { say "session CA variables not pushed: user manager unreadable"; return 0; }
+  for n in SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE NODE_EXTRA_CA_CERTS; do
+    v="$(ca_env_value "$file" "$n")"
+    case "$v" in ''|*[!A-Za-z0-9_./-]*) continue ;; esac
+    grep -q "^$n=" <<<"$have" || set_args+=("$n=$v")
+  done
+  [ "${#set_args[@]}" -gt 0 ] || { say "session CA variables already set in the user manager"; return 0; }
+  if as_owner env "XDG_RUNTIME_DIR=$run" systemctl --user set-environment "${set_args[@]}" 2>/dev/null; then
+    say "session CA variables set for programs started from now on: ${set_args[*]%%=*}"
+  else
+    say "session CA variables not pushed: set-environment failed"
+  fi
 }
 
 # WARN when the session holds pre-install CA variables
@@ -3302,7 +3345,7 @@ verify() {
     else bad "failsafe timer not active"
     fi
     echo "  units: proxy $(systemctl is-enabled guardrail-proxy.service 2>&1)/$(systemctl is-active guardrail-proxy.service 2>&1), sync timer $(systemctl is-enabled guardrail-sync.timer 2>&1), net $(systemctl is-enabled guardrail-net.service 2>&1)"
-  elif [ -f "$FSPID" ] && kill -0 "$(cat "$FSPID")" 2>/dev/null; then ok "background failsafe pid $(cat "$FSPID")"
+  elif [ -f "$FSPID" ] && grep -qa failsafe-fire "/proc/$(cat "$FSPID")/cmdline" 2>/dev/null; then ok "background failsafe pid $(cat "$FSPID")"
   else bad "no failsafe armed"; fi
   # only check owner request when a rule is installed
   if [ "$ru" = 1 ]; then

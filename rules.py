@@ -2309,7 +2309,7 @@ def running_ai_apps() -> list[dict]:
 
 _AI_IPS: dict = {}
 _AI_IPS_FILE = base_dir() / "data" / "endpoint-ips.json"
-_AI_IPS_AT = 0.0
+_AI_IPS_AT = float("-inf")
 _AI_IPS_TTL = 1800.0                      # a resolved address is reused for half an hour
 
 
